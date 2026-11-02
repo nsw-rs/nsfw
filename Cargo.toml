@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "nsfw-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Nintendo Switch NSP validation and Standard NSP conversion (Rust port of nsfw)"
+license = "(MIT OR Apache-2.0) AND Apache-2.0"
+authors = ["Timothy Redaelli <timothy.redaelli@gmail.com>"]
+repository = "https://github.com/nsw-rs/nsfw"
+readme = "README.md"
+keywords = ["nintendo-switch", "nsp", "validation", "titledb"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "nsfw"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+hex = "0.4.3"
+indexmap = { version = "2.14.2", features = ["serde"] }
+indicatif = "0.18.6"
+libhac = "0.1.0"
+regex = "1.13.1"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
