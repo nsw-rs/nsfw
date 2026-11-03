@@ -116,6 +116,10 @@ Options:
   -h, --help               Print help
 ```
 
+NSZ files (NSPs with compressed `.ncz` NCAs, block or solid) are accepted
+too, also in directory scans. They are reported with a "Compressed NCA"
+warning. See below for converting them to Standard NSP.
+
 ### Validate - Example Usage
 
 Validate
@@ -183,6 +187,13 @@ available). This will also **DELETE** the original/source file if conversion
 is successful.
 
 `./nsfw v -s --sl -y -Z <PATH_TO_NSP_FILE>`
+
+Create "Standard NSP" from an NSZ - NSZ files (solid or block compressed)
+are accepted as input. Like NSFW, an NSZ whose layout is already standard is
+reported as Standard NSP and skipped, so `--force-convert` is needed to write
+the decompressed NSP.
+
+`./nsfw v -s --force-convert <PATH_TO_NSZ_FILE>`
 
 ---
 

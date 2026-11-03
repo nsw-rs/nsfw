@@ -16,6 +16,7 @@ use libhac::cnmt::{self, Cnmt, ContentAttributes, MetaType};
 use libhac::keys::Keys;
 use libhac::nacp::Nacp;
 use libhac::nca::{ContentType, DistributionType, FsType, Nca, SectionIndex, TitleKeys};
+use libhac::ncz::NczReader;
 use libhac::partition::PartitionFs;
 use libhac::pfs0::Pfs0Builder;
 use libhac::romfs::RomFs;
@@ -79,6 +80,8 @@ struct ContentFile {
     file_name: String,
     hash: [u8; 32],
     content_type: cnmt::ContentEntryType,
+    /// Present in the NSP only as `<nca id>.ncz`.
+    compressed: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -103,7 +106,28 @@ impl NcaInfo {
 struct FsNca<'a> {
     file_name: String,
     nca_id: String,
+    /// For an `.ncz` entry this is the raw NCZ: only the header, which NCZ
+    /// keeps uncompressed, reads as the NCA.
     nca: Nca<SubStorage<&'a File>>,
+    ncz: Option<NczReader<SubStorage<&'a File>>>,
+}
+
+impl FsNca<'_> {
+    /// For an `.ncz` entry, the file name without `.ncz`: the SHA256 prefix
+    /// of the decompressed NCA.
+    fn ncz_target_hash(&self) -> &str {
+        self.file_name
+            .strip_suffix(".ncz")
+            .unwrap_or(&self.file_name)
+    }
+
+    /// Name and size of this NCA in the Standard NSP.
+    fn output(&self) -> Result<(String, u64)> {
+        Ok(match &self.ncz {
+            Some(z) => (format!("{}.nca", self.ncz_target_hash()), z.size()?),
+            None => (self.file_name.clone(), self.nca.storage().size()?),
+        })
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -267,6 +291,7 @@ enum Planned {
     SkipDelta(String),
     DeltaNotFound(String),
     Missing(String),
+    MissingNcz(String),
 }
 
 fn plan_content(content_files: &[ContentFile], ncas: &[FsNca], keep_deltas: bool) -> Vec<Planned> {
@@ -277,6 +302,14 @@ fn plan_content(content_files: &[ContentFile], ncas: &[FsNca], keep_deltas: bool
             let name = cf.file_name.clone();
             if !keep_deltas && is_delta {
                 return Planned::SkipDelta(name);
+            }
+            if cf.compressed {
+                let stem = cf.file_name.strip_suffix(".nca").unwrap_or(&cf.file_name);
+                let ncz = format!("{stem}.ncz");
+                return match ncas.iter().position(|n| n.file_name == ncz) {
+                    Some(i) => Planned::Add(i),
+                    None => Planned::MissingNcz(ncz),
+                };
             }
             match ncas.iter().position(|n| n.file_name == cf.file_name) {
                 Some(i) => Planned::Add(i),
@@ -340,16 +373,15 @@ impl PartialNsp {
             hashes: HashMap::new(),
         };
         let mut layout = Pfs0Builder::new();
+        let mut total = 0;
         for &i in order {
-            layout.add_file(ncas[i].file_name.as_str(), ncas[i].nca.storage().size()?);
+            let (name, size) = ncas[i].output()?;
+            layout.add_file(name.as_str(), size);
+            total += size;
         }
         for (n, b) in tail {
             layout.add_file(n.as_str(), b.len() as u64);
         }
-        let total = order
-            .iter()
-            .map(|&i| ncas[i].nca.storage().size())
-            .sum::<std::result::Result<u64, _>>()?;
 
         let out = p
             .out
@@ -357,14 +389,26 @@ impl PartialNsp {
         out.write_all(&layout.to_bytes())?;
         let pb = progress_bar("Writing", total);
         for &i in order {
-            let r = ncas[i].nca.storage();
             let mut sha = Sha256::new();
-            src.read_chunks(r.offset(), r.size()?, &mut |chunk| {
+            let mut copy = |chunk: &[u8]| {
                 sha.update(chunk);
                 out.write_all(chunk)?;
                 pb.inc(chunk.len() as u64);
                 Ok(())
-            })?;
+            };
+            if let Some(z) = &ncas[i].ncz {
+                z.read_chunks(0, z.size()?, &mut copy)?;
+                let current = hex::encode_upper(&sha.finalize()[..16]);
+                let target = ncas[i].ncz_target_hash().to_uppercase();
+                if current != target {
+                    bail!(
+                        "Current hash ({current}) does not match original hash ({target}). File is corrupted."
+                    );
+                }
+                continue;
+            }
+            let r = ncas[i].nca.storage();
+            src.read_chunks(r.offset(), r.size()?, &mut copy)?;
             p.hashes
                 .insert(ncas[i].file_name.clone(), hex::encode_upper(sha.finalize()));
         }
@@ -421,6 +465,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut errors = Messages::default();
+    let mut warnings = Messages::default();
     let mut can_proceed = true;
     let mut generate_new_ticket = false;
     let mut bad_padding = false;
@@ -523,12 +568,8 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                 }
             }
 
-            if name.ends_with(".ncz") {
-                ftl!("{phase} <- NCZ not supported yet ({name})");
-                return Ok(Some(1));
-            }
-
-            if name.ends_with(".nca") {
+            let is_ncz = name.ends_with(".ncz");
+            if name.ends_with(".nca") || is_ncz {
                 let nca = match Nca::open(keys, range) {
                     Ok(n) => n,
                     Err(err) => {
@@ -543,6 +584,13 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                 if ncas.iter().any(|n| n.nca_id.eq_ignore_ascii_case(&nca_id)) {
                     bail!("duplicate NCA id");
                 }
+                let ncz = if is_ncz {
+                    let reader = NczReader::open(SubStorage::new(&file, e.offset, e.size)?)?;
+                    warnings.add(format!("{phase} <- Compressed NCA (NCZ) detected."));
+                    Some(reader)
+                } else {
+                    None
+                };
                 let ct = nca.content_type();
                 if main_nca.is_none()
                     && (ct == ContentType::PROGRAM || ct == ContentType::PUBLIC_DATA)
@@ -567,11 +615,11 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                     file_name: name.clone(),
                     nca_id,
                     nca,
+                    ncz,
                 });
             }
 
-            // NCZ returned above, so every other known kind has a priority.
-            if assign_priority(name).is_none() {
+            if assign_priority(name).is_none() && !is_ncz {
                 has_loose_files = true;
             }
             if raw_entries.iter().any(|r| &r.name == name) {
@@ -690,24 +738,32 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             ftl!("NSP Validation failed.");
             return Ok(1);
         }
-        match raw_entries.iter().find(|r| r.name == file_name) {
+        let compressed = match raw_entries.iter().find(|r| r.name == file_name) {
+            None if ce.content_type == cnmt::ContentEntryType::DELTA_FRAGMENT => {
+                delta_count += 1;
+                false
+            }
+            None if ncas
+                .iter()
+                .any(|n| n.ncz.is_some() && n.nca_id.eq_ignore_ascii_case(&nca_id)) =>
+            {
+                true
+            }
             None => {
-                if ce.content_type != cnmt::ContentEntryType::DELTA_FRAGMENT {
-                    errors.add(format!(
-                        "{phase} - NSP file-system is missing content file : {file_name}"
-                    ));
-                    can_proceed = false;
-                } else {
-                    delta_count += 1;
-                }
+                errors.add(format!(
+                    "{phase} - NSP file-system is missing content file : {file_name}"
+                ));
+                can_proceed = false;
+                false
             }
             Some(r) => {
                 if r.size != ce.size {
                     errors.add(format!("{phase} - NSP file-system contains files with sizes that do not match the CNMT."));
                     can_proceed = false;
                 }
+                false
             }
-        }
+        };
         if content_files.iter().any(|c| c.file_name == file_name) {
             bail!("An item with the same key has already been added. Key: {file_name}");
         }
@@ -715,6 +771,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             file_name,
             hash: ce.hash,
             content_type: ce.content_type,
+            compressed,
         });
     }
 
@@ -1091,7 +1148,9 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             || !is_file_order_correct
             || copy_new_cert
             || bad_padding)
-        && !plan.iter().any(|p| matches!(p, Planned::Missing(_)))
+        && !plan
+            .iter()
+            .any(|p| matches!(p, Planned::Missing(_) | Planned::MissingNcz(_)))
         && utf16_len(&target_str) <= 254
         && !(target_name == nsp_path || is_same_file(&target_name, nsp_path));
     let mut pending = None;
@@ -1105,6 +1164,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         pending = PartialNsp::start(&target_name, &whole, &ncas, &order, &tail).ok();
     }
 
+    let has_compressed_nca = ncas.iter().any(|n| n.ncz.is_some());
     let mut nca_files: Vec<NcaInfo> = Vec::new();
     for fs_nca in &ncas {
         let nca = &fs_nca.nca;
@@ -1131,7 +1191,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                 errors.add(format!("{phase} - {name} <- NPDM signature is invalid."));
                 can_proceed = false;
             }
-            None if ct == ContentType::PROGRAM && !has_sparse_ncas => {
+            None if ct == ContentType::PROGRAM && !has_sparse_ncas && !has_compressed_nca => {
                 errors.add(format!("{phase} - {name} <- Error opening NPDM."));
             }
             _ => {}
@@ -1146,6 +1206,10 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             }
             if check_section_fs(nca, i, &title_keys).is_err() && !has_sparse_ncas {
                 info.sections_errored = true;
+                // The sections of an NCZ are compressed, so they never open.
+                if fs_nca.ncz.is_some() {
+                    continue;
+                }
                 let type_name = if ct == ContentType::DATA {
                     "Delta"
                 } else {
@@ -1238,6 +1302,9 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     } else {
         inf!("Validation Complete <- Problems found");
     }
+    for w in &warnings.0 {
+        wrn!("{w}");
+    }
     for e in &errors.0 {
         crate::err!("{e}");
     }
@@ -1296,6 +1363,10 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             rows.push(("Release Date", d.clone()));
         }
         rows.push(("Has Sparse NCAs ?", yes_no(has_sparse_ncas).into()));
+        rows.push((
+            "Is Main NCA Compressed ?",
+            yes_no(has_compressed_nca).into(),
+        ));
         rows.push(("Key Generation", key_gen.to_string()));
         rows.push(("NSP Version", display_version.clone()));
         rows.push(("Rights ID", rights_id_display.clone()));
@@ -1404,6 +1475,10 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             Planned::SkipDelta(name) => inf!("[SKIP] -> Skipping delta fragment: {name}"),
             Planned::Missing(name) => {
                 crate::err!("Failed to locate NCA file {name} in the NSP file-system.");
+                return Ok(1);
+            }
+            Planned::MissingNcz(name) => {
+                crate::err!("Failed to locate NCZ file {name} in the NSP file-system.");
                 return Ok(1);
             }
             Planned::DeltaNotFound(name) => {
