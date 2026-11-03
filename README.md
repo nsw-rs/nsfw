@@ -54,9 +54,13 @@ This tool would not be possible without the work and knowledge of:
    [latest release](https://github.com/nsw-rs/nsfw/releases/latest) and
    extract `nsfw` (`nsfw.exe` on Windows) to a directory of your choice.
    Linux binaries are statically linked.
-1. Put your keys in `~/.switch/prod.keys` and the common certificate chain in
-   `~/.switch/common.cert` (or pass `-k` and `-c`). On Windows `~` is your
-   user profile directory.
+1. Put your keys in `~/.switch/prod.keys` (or pass `-k`). On Windows `~` is
+   your user profile directory.
+1. (*Optional*) The common certificate chain `~/.switch/common.cert` (or
+   `-c`) is not shipped because it is Nintendo data. If it is missing, nsfw
+   takes it from the first NSP it processes that has a ticket (BASE, UPD or
+   DLC) and saves it there. Its SHA-256 is
+   `3c4f20dca231655e90c75b3e9689e4dd38135401029ab1f2ea32d1c2573f1dfe`.
 1. (*Optional*) Put a `titledb.db` in a directory called `titledb` in the
    current directory. Either take it from an NSFW release, or build it with
    `nsfw build-titledb` (see below).
@@ -94,7 +98,7 @@ Arguments:
 
 Options:
   -k, --keys <KEYS>        Path to NSW keys file [default: ~/.switch/prod.keys]
-  -c, --cert <CERT>        Path to 0x700-byte long common certificate chain file [default: ~/.switch/common.cert]
+  -c, --cert <CERT>        Path to 0x700-byte long common certificate chain file (created from the NSP if missing) [default: ~/.switch/common.cert]
   -s, --standard           Convert to Standardised NSP
   -o, --nspdir <NSPDIR>    Path to standardised NSP output directory [default: ./nsp]
   -d, --dryrun             Prints actions to be performed but does not execute any of them

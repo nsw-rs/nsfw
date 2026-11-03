@@ -51,7 +51,7 @@ struct ValidateArgs {
     /// Path to NSW keys file.
     #[arg(short = 'k', long = "keys", default_value = "~/.switch/prod.keys")]
     keys: String,
-    /// Path to 0x700-byte long common certificate chain file.
+    /// Path to 0x700-byte long common certificate chain file (created from the NSP if missing).
     #[arg(short = 'c', long = "cert", default_value = "~/.switch/common.cert")]
     cert: String,
     /// Convert to Standardised NSP.
@@ -215,12 +215,17 @@ fn validate(args: ValidateArgs) -> u8 {
         eprintln!("Error: Keys file '{}' does not exist.", keys_path.display());
         return 1;
     }
-    let Ok(cert) = std::fs::read(&cert_path) else {
-        eprintln!(
-            "Error: Certificate file '{}' does not exist.",
-            cert_path.display()
-        );
-        return 1;
+    let cert = match std::fs::read(&cert_path) {
+        Ok(c) => Some(c),
+        // Taken from the first NSP that carries it and cached there.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!(
+                "Error: failed to read certificate file '{}': {e}",
+                cert_path.display()
+            );
+            return 1;
+        }
     };
     if args.standard
         && !nsp_dir.is_dir()
@@ -229,7 +234,10 @@ fn validate(args: ValidateArgs) -> u8 {
         eprintln!("Error: failed to create {}: {e}", nsp_dir.display());
         return 1;
     }
-    if cert.len() != validate::COMMON_CERT_SIZE || !validate::is_common_cert(&cert) {
+    if cert
+        .as_deref()
+        .is_some_and(|c| !validate::is_common_cert(c))
+    {
         eprintln!("Error: Common cert '{}' is invalid.", cert_path.display());
         return 1;
     }
@@ -257,7 +265,8 @@ fn validate(args: ValidateArgs) -> u8 {
         language_mode = LanguageMode::Short;
     }
     let settings = validate::Settings {
-        cert,
+        cert: cert.map(std::cell::OnceCell::from).unwrap_or_default(),
+        cert_path,
         convert: args.standard,
         nsp_dir,
         dry_run: args.dryrun,

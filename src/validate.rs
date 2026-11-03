@@ -24,6 +24,7 @@ use libhac::romfs::RomFs;
 use libhac::ticket::{LicenseType, SignatureType, Ticket, TitleKeyType};
 use libhac::{ReadAt, SubStorage, TitleId, npdm};
 use sha2::{Digest, Sha256};
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -37,8 +38,27 @@ pub fn is_common_cert(data: &[u8]) -> bool {
     hex::encode(Sha256::digest(data)) == COMMON_CERT_SHA256
 }
 
+/// Size of the `XS00000020` ticket signer certificate, the first one in the
+/// common chain. Some update NSPs carry the chain with the two certificates
+/// swapped (`XS00000020` then `CA00000003`).
+const XS_CERT_SIZE: usize = 0x300;
+
+/// Returns `data` with its two certificates swapped back into canonical
+/// order, or `None` when that is not the common chain either.
+fn swapped_common_cert(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() != COMMON_CERT_SIZE {
+        return None;
+    }
+    let swapped = [&data[XS_CERT_SIZE..], &data[..XS_CERT_SIZE]].concat();
+    is_common_cert(&swapped).then_some(swapped)
+}
+
 pub struct Settings {
-    pub cert: Vec<u8>,
+    /// Common certificate chain, loaded from `cert_path` or taken from the
+    /// first NSP that carries it.
+    pub cert: OnceCell<Vec<u8>>,
+    /// Where the common certificate is cached when it is taken from an NSP.
+    pub cert_path: PathBuf,
     pub convert: bool,
     pub nsp_dir: PathBuf,
     pub dry_run: bool,
@@ -334,15 +354,42 @@ fn output_order(plan: &[Planned], meta_idx: usize) -> Vec<usize> {
 }
 
 /// Ticket and certificate written after the NCAs, when the title uses title-key crypto.
-fn tail_files(ticket: Option<&Ticket>, cert: &[u8]) -> Vec<(String, Vec<u8>)> {
+/// `None` when a ticket is written but no common certificate is available.
+fn tail_files(ticket: Option<&Ticket>, cert: Option<&Vec<u8>>) -> Option<Vec<(String, Vec<u8>)>> {
     let Some(t) = ticket else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     let rid = hex::encode(t.rights_id.0);
-    vec![
+    Some(vec![
         (format!("{rid}.tik"), t.to_bytes()),
-        (format!("{rid}.cert"), cert.to_vec()),
-    ]
+        (format!("{rid}.cert"), cert?.clone()),
+    ])
+}
+
+const NO_CERT: &str = "No common certificate available. Process an NSP with a valid ticket certificate first, or supply one with --cert.";
+
+/// Keeps the common certificate taken from an NSP for the rest of the run and
+/// saves it to `cert_path` when that file does not exist yet.
+fn cache_common_cert(settings: &Settings, cert: Vec<u8>) {
+    let cert = settings.cert.get_or_init(|| cert);
+    if settings.dry_run || settings.cert_path.exists() {
+        return;
+    }
+    let written = settings
+        .cert_path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&settings.cert_path, cert));
+    match written {
+        Ok(()) => inf!(
+            "Common certificate cached to {}",
+            olive(settings.cert_path.display())
+        ),
+        Err(e) => wrn!(
+            "Failed to cache common certificate to {}: {e}",
+            olive(settings.cert_path.display())
+        ),
+    }
 }
 
 /// A Standard NSP being written next to its target as `<target>.part`.
@@ -573,12 +620,26 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                         paren(name)
                     );
                     copy_new_cert = true;
-                } else if !is_common_cert(&range.read_vec(0, e.size as usize)?) {
-                    wrn!(
-                        "{phase} <- Certificate does not match common certificate SHA256. {}",
-                        paren(name)
-                    );
-                    copy_new_cert = true;
+                } else {
+                    let data = range.read_vec(0, e.size as usize)?;
+                    let is_common = is_common_cert(&data);
+                    if !is_common {
+                        wrn!(
+                            "{phase} <- Certificate does not match common certificate SHA256. {}",
+                            paren(name)
+                        );
+                        copy_new_cert = true;
+                    }
+                    if settings.cert.get().is_none() {
+                        let cert = if is_common {
+                            Some(data)
+                        } else {
+                            swapped_common_cert(&data)
+                        };
+                        if let Some(cert) = cert {
+                            cache_common_cert(settings, cert);
+                        }
+                    }
                 }
             }
 
@@ -946,7 +1007,11 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                 generate_new_ticket = true;
             }
         } else {
-            is_ticket_signature_valid = t.verify_signature(&settings.cert);
+            let Some(cert) = settings.cert.get() else {
+                ftl!("{phase} - {NO_CERT}");
+                return Ok(1);
+            };
+            is_ticket_signature_valid = t.verify_signature(cert);
         }
         if !is_ticket_signature_valid {
             errors.add(format!("{phase} - Ticket signature is invalid."));
@@ -1176,12 +1241,13 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     let mut pending = None;
     if would_convert {
         let order = output_order(&plan, meta_idx);
-        let tail = tail_files(
-            ticket.as_ref().filter(|_| has_title_key_crypto),
-            &settings.cert,
-        );
         // On failure the normal write path below retries and reports the error.
-        pending = PartialNsp::start(&target_name, &whole, &ncas, &order, &tail).ok();
+        if let Some(tail) = tail_files(
+            ticket.as_ref().filter(|_| has_title_key_crypto),
+            settings.cert.get(),
+        ) {
+            pending = PartialNsp::start(&target_name, &whole, &ncas, &order, &tail).ok();
+        }
     }
 
     let has_compressed_nca = ncas.iter().any(|n| n.ncz.is_some());
@@ -1547,10 +1613,13 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         );
     }
 
-    let tail = tail_files(
+    let Some(tail) = tail_files(
         ticket.as_ref().filter(|_| has_title_key_crypto),
-        &settings.cert,
-    );
+        settings.cert.get(),
+    ) else {
+        ftl!("{phase} - {NO_CERT}");
+        return Ok(1);
+    };
     if settings.dry_run {
         for (name, _) in &tail {
             inf!("{} -> Would add: {}", tag("DRYRUN"), olive(name));
@@ -1657,4 +1726,25 @@ fn import_ticket(
     }
     *current = Some(t);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swapped_common_cert_rejects_other_data() {
+        let mut x: u32 = 0x1234_5678;
+        let data: Vec<u8> = (0..COMMON_CERT_SIZE)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        assert_eq!(swapped_common_cert(&data), None);
+        assert_eq!(swapped_common_cert(&data[..0x6FF]), None);
+        assert_eq!(swapped_common_cert(&[]), None);
+    }
 }
