@@ -14,6 +14,14 @@ repository = "https://github.com/nsw-rs/nsfw"
 readme = "README.md"
 keywords = ["nintendo-switch", "nsp", "validation", "titledb"]
 categories = ["command-line-utilities"]
+exclude = ["/.github", "/.gitignore", "/deny.toml"]
+
+# Matches the asset names and layout made by .github/workflows/release.yml.
+# pkg-fmt is left unset so binstall tries both the .tar.gz and .zip archives.
+# Assets use the binary name "nsfw", not the package name.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/nsfw-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "nsfw-v{ version }-{ target }/{ bin }{ binary-ext }"
 
 [[bin]]
 name = "nsfw"
