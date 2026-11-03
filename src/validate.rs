@@ -7,6 +7,7 @@
 //! Port of `ValidateNspService.Process`: validate an NSP and optionally
 //! rewrite it as a Standard NSP.
 
+use crate::log::{blue, green, grey, olive, paren, red, tag};
 use crate::naming::{self, Lang, LanguageMode, NameInputs};
 use crate::titledb::TitleDb;
 use crate::{ftl, inf, vrb, wrn};
@@ -457,7 +458,7 @@ pub fn process(settings: &Settings, keys: &Keys, nsp_path: &Path) -> i32 {
 
 fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i32> {
     if !nsp_path.is_file() {
-        ftl!("File not found: {}", nsp_path.display());
+        ftl!("File not found: {}", olive(nsp_path.display()));
         return Ok(1);
     }
     let file_name = nsp_path
@@ -473,35 +474,45 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     let mut has_loose_files = false;
     let mut has_sparse_ncas = false;
 
-    inf!("Validating NSP : {file_name}");
+    inf!("Validating NSP : {}", olive(&file_name));
     if settings.convert {
         let mut extra = String::new();
         if settings.dry_run {
-            extra = " (Dry Run)".into();
+            extra = format!(" ({})", olive("Dry Run"));
         }
         if settings.force_convert {
-            extra = " (Force)".into();
+            extra = format!(" ({})", olive("Force"));
         }
         if settings.delete_source {
-            extra += " (Delete Source)";
+            extra += &format!(" ({})", olive("Delete Source"));
         }
-        inf!("Output Mode <- CONVERT{extra}");
+        inf!("Output Mode <- {}{extra}", green("CONVERT"));
     }
 
     let titledb = if settings.titledb.is_file() {
         let db = TitleDb::open(&settings.titledb)?;
         if settings.verify_title {
-            vrb!("TitleDB <- Found ({})", settings.titledb.display());
+            vrb!(
+                "{} <- {} {}",
+                olive("TitleDB"),
+                green("Found"),
+                paren(settings.titledb.display())
+            );
         }
         Some(db)
     } else {
         if settings.verify_title {
-            wrn!("TitleDB <- Not Found ({})", settings.titledb.display());
+            wrn!(
+                "{} <- {} {}",
+                olive("TitleDB"),
+                red("Not Found"),
+                paren(settings.titledb.display())
+            );
         }
         None
     };
 
-    let mut phase = "Validate File Structure";
+    let mut phase = olive("Validate File Structure");
     let file = File::open(nsp_path)?;
     let file_size = file.metadata()?.len();
     let whole = SubStorage::new(&file, 0, file_size)?;
@@ -518,7 +529,8 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     if header_size != aligned_header_size {
         bad_padding = true;
         errors.add(format!(
-            "{phase} <- NSP file-header is not aligned correctly. ({header_size:08X}=>{aligned_header_size:08X})"
+            "{phase} <- NSP file-header is not aligned correctly. {}",
+            paren(format_args!("{header_size:08X}=>{aligned_header_size:08X}"))
         ));
     }
 
@@ -532,7 +544,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         }
     }
 
-    phase = "Validate File-System";
+    phase = olive("Validate File-System");
 
     let mut raw_entries: Vec<RawEntry> = Vec::new();
     let mut title_keys = TitleKeys::new();
@@ -551,18 +563,20 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             if name.ends_with(".tik") {
                 let t = Ticket::parse(&range.read_vec(0, e.size as usize)?)?;
                 import_ticket(t, keys, &mut title_keys, &mut ticket)?;
-                vrb!("{phase} <- Ticket imported ({name})");
+                vrb!("{phase} <- Ticket imported {}", paren(name));
             }
 
             if name.ends_with(".cert") {
                 if e.size as usize != COMMON_CERT_SIZE {
                     wrn!(
-                        "{phase} <- Certificate size is incorrect. Expected 0x700 bytes. ({name})"
+                        "{phase} <- Certificate size is incorrect. Expected 0x700 bytes. {}",
+                        paren(name)
                     );
                     copy_new_cert = true;
                 } else if !is_common_cert(&range.read_vec(0, e.size as usize)?) {
                     wrn!(
-                        "{phase} <- Certificate does not match common certificate SHA256. ({name})"
+                        "{phase} <- Certificate does not match common certificate SHA256. {}",
+                        paren(name)
                     );
                     copy_new_cert = true;
                 }
@@ -586,7 +600,10 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                 }
                 let ncz = if is_ncz {
                     let reader = NczReader::open(SubStorage::new(&file, e.offset, e.size)?)?;
-                    warnings.add(format!("{phase} <- Compressed NCA (NCZ) detected."));
+                    warnings.add(format!(
+                        "{phase} <- Compressed NCA ({}) detected.",
+                        blue("NCZ")
+                    ));
                     Some(reader)
                 } else {
                     None
@@ -647,7 +664,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         vrb!("{phase} <- No valid tickets found.");
     }
 
-    phase = "Validate Padding";
+    phase = olive("Validate Padding");
     let table_size: i64 = raw_entries.iter().map(|e| e.name.len() as i64 + 1).sum();
     let aligned_table_size = (table_size + 0x1F) & !0x1F;
     if table_size == aligned_table_size && aligned_table_size == string_table_size {
@@ -660,10 +677,10 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         vrb!("String Table Size (Aligned) : {aligned_table_size}");
         vrb!("String Table Size (Header)  : {string_table_size}");
         if bad_padding {
-            ftl!("{phase} <- Failed");
+            ftl!("{phase} <- {}", red("Failed"));
             return Ok(1);
         }
-        inf!("{phase} <- Passed");
+        inf!("{phase} <- {}", green("Passed"));
         return Ok(0);
     }
 
@@ -696,10 +713,10 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         }
     }
 
-    phase = "Open File-System";
+    phase = olive("Open File-System");
     vrb!("{phase} <- Loaded correctly.");
 
-    phase = "Validate Metadata (CNMT)";
+    phase = olive("Validate Metadata (CNMT)");
     let Some(cnmt) = metadata else {
         ftl!("Failed to open CNMT.");
         return Ok(1);
@@ -781,7 +798,8 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
 
     let is_update = matches!(title_type, MetaType::PATCH | MetaType::DATA_PATCH);
     vrb!(
-        "NSP Type <- {}{}",
+        "{} <- {}{}",
+        olive("NSP Type"),
         display_type(title_type),
         if is_update {
             format!(" ({title_version})")
@@ -794,7 +812,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         bail!("Sequence contains no elements (no CNMT content found in NSP)");
     };
 
-    phase = "Validate Main NCA";
+    phase = olive("Validate Main NCA");
     let Some(main_idx) = main_nca else {
         ftl!("{phase} - Failed to open Main NCA.");
         ftl!("NSP Validation failed.");
@@ -839,7 +857,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     let mut master_key_rev = 0u8;
 
     if let (true, Some(t)) = (has_title_key_crypto, &ticket) {
-        phase = "Validate Ticket";
+        phase = olive("Validate Ticket");
         if t.signature_type != SignatureType::RSA2048_SHA256 {
             ftl!(
                 "{phase} - Unsupported ticket signature type {:#X}",
@@ -909,7 +927,8 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                 let ticket_rights = t.rights_id.to_string();
                 if !name.eq_ignore_ascii_case(&ticket_rights) {
                     crate::err!(
-                        "{phase} - The ticket in this NSP does not match the title key of the main NCA ({name}/{ticket_rights})"
+                        "{phase} - The ticket in this NSP does not match the title key of the main NCA {}",
+                        paren(format_args!("{name}/{ticket_rights}"))
                     );
                 }
                 ftl!("NSP Validation failed.");
@@ -1115,14 +1134,15 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     let target_name = settings.nsp_dir.join(output_file);
     if settings.convert && target_name.exists() && !settings.overwrite {
         ftl!(
-            "File already exists. ({}). Use --overwrite to overwrite an existing file.",
-            target_name.display()
+            "File already exists. ({}). Use {} to overwrite an existing file.",
+            target_name.display(),
+            grey("--overwrite")
         );
         return Ok(2);
     }
 
     // VALIDATE NCAS
-    phase = "Validate NCAs";
+    phase = olive("Validate NCAs");
     if ncas.is_empty() {
         ftl!("{phase} - No NCAs found.");
         ftl!("NSP Validation failed.");
@@ -1275,7 +1295,11 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     }
 
     if !is_file_order_correct {
-        errors.add("NCA File Order <- Non-standard".into());
+        errors.add(format!(
+            "{} <- {}",
+            olive("NCA File Order"),
+            red("Non-standard")
+        ));
     }
 
     let header_signature_valid = nca_files.iter().all(|n| n.header_valid);
@@ -1294,13 +1318,26 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             .iter()
             .all(|n| n.hash_match != HashMatch::Mismatch)
     {
-        inf!("Validation Complete <- No problems found");
         inf!(
-            "Is Standard NSP?  <- {}",
-            if is_standard_nsp { "Yes" } else { "No" }
+            "{} <- {}",
+            olive("Validation Complete"),
+            green("No problems found")
+        );
+        inf!(
+            "{} <- {}",
+            olive("Is Standard NSP? "),
+            if is_standard_nsp {
+                green("Yes")
+            } else {
+                red("No")
+            }
         );
     } else {
-        inf!("Validation Complete <- Problems found");
+        inf!(
+            "{} <- {}",
+            olive("Validation Complete"),
+            red("Problems found")
+        );
     }
     for w in &warnings.0 {
         wrn!("{w}");
@@ -1310,15 +1347,20 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     }
 
     if !crate::log::is_quiet() {
-        let yes_no = |b: bool| if b { "Yes" } else { "No" };
-        let valid = |b: bool| if b { "Valid" } else { "Invalid" };
-        let mut rows: Vec<(&str, String)> =
-            vec![("Title", format!("{display_title} (From {source:?})"))];
+        // Colored "Yes" for a set flag, plain "No" otherwise.
+        let flag =
+            |b: bool, paint: fn(&'static str) -> String| if b { paint("Yes") } else { "No".into() };
+        let valid = |b: bool| if b { green("Valid") } else { red("Invalid") };
+        let pass = |ok: bool, good: &str, bad: &str| if ok { green(good) } else { red(bad) };
+        let mut rows: Vec<(&str, String)> = vec![(
+            "Title",
+            format!("{} (From {source:?})", olive(&display_title)),
+        )];
         if let Some(p) = display_parent_title
             .as_deref()
             .filter(|p| is_dlc && !p.is_empty())
         {
-            rows.push(("Parent Title", format!("{p} (From {source:?})")));
+            rows.push(("Parent Title", format!("{} (From {source:?})", olive(p))));
         }
         if !langs.is_empty() {
             rows.push((
@@ -1353,27 +1395,24 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                 title_version.clone()
             },
         ));
-        rows.push(("Is Interactive Display ?", yes_no(is_retail_display).into()));
-        rows.push(("Is Demo ?", yes_no(is_demo).into()));
-        rows.push(("Is DLC Unlocker ?", yes_no(possible_dlc_unlocker).into()));
+        rows.push(("Is Interactive Display ?", flag(is_retail_display, olive)));
+        rows.push(("Is Demo ?", flag(is_demo, olive)));
+        rows.push(("Is DLC Unlocker ?", flag(possible_dlc_unlocker, red)));
         if let Some(d) = release_date
             .as_ref()
             .filter(|_| title_type == MetaType::APPLICATION)
         {
             rows.push(("Release Date", d.clone()));
         }
-        rows.push(("Has Sparse NCAs ?", yes_no(has_sparse_ncas).into()));
-        rows.push((
-            "Is Main NCA Compressed ?",
-            yes_no(has_compressed_nca).into(),
-        ));
+        rows.push(("Has Sparse NCAs ?", flag(has_sparse_ncas, olive)));
+        rows.push(("Is Main NCA Compressed ?", flag(has_compressed_nca, blue)));
         rows.push(("Key Generation", key_gen.to_string()));
         rows.push(("NSP Version", display_version.clone()));
         rows.push(("Rights ID", rights_id_display.clone()));
-        rows.push(("Header Validity", valid(header_signature_valid).into()));
+        rows.push(("Header Validity", valid(header_signature_valid)));
         rows.push((
             "NCA Validity",
-            valid(nca_files.iter().all(|n| !n.is_errored())).into(),
+            valid(nca_files.iter().all(|n| !n.is_errored())),
         ));
         let nca_count = raw_entries
             .iter()
@@ -1388,43 +1427,30 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             "Raw File Count",
             format!("{} ({nca_count} NCAs{deltas})", raw_entries.len()),
         ));
-        rows.push(("Has loose files ?", yes_no(has_loose_files).into()));
+        rows.push(("Has loose files ?", pass(!has_loose_files, "No", "Yes")));
         rows.push((
             "NCA File Order",
-            if is_file_order_correct {
-                "Correct"
-            } else {
-                "Non-Standard"
-            }
-            .into(),
+            pass(is_file_order_correct, "Correct", "Non-Standard"),
         ));
-        rows.push((
-            "File Padding",
-            if bad_padding { "Incorrect" } else { "Correct" }.into(),
-        ));
+        rows.push(("File Padding", pass(!bad_padding, "Correct", "Incorrect")));
         if let (Some(enc), Some(dec)) = (title_key_encrypted, title_key_decrypted) {
             rows.push(("TitleKey (Enc)", hex::encode_upper(enc)));
             rows.push(("TitleKey (Dec)", hex::encode_upper(dec)));
             rows.push((
                 "Ticket Signature",
                 if is_normalised_signature && title_type == MetaType::APPLICATION {
-                    "Normalised".into()
+                    green("Normalised")
                 } else {
-                    valid(is_ticket_signature_valid).into()
+                    valid(is_ticket_signature_valid)
                 },
             ));
             rows.push((
                 "Ticket Properties",
-                if generate_new_ticket {
-                    "Non-Standard"
-                } else {
-                    "Passed"
-                }
-                .into(),
+                pass(!generate_new_ticket, "Passed", "Non-Standard"),
             ));
             rows.push(("MasterKey Revision", master_key_rev.to_string()));
         }
-        rows.push(("Output Name", output_name.clone()));
+        rows.push(("Output Name", olive(&output_name)));
         let width = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
         println!();
         for (k, v) in rows {
@@ -1467,32 +1493,58 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         return Ok(0);
     }
     if settings.dry_run {
-        inf!("[DRYRUN] -> Would create: {output_name}.nsp");
+        inf!(
+            "{} -> Would create: {}",
+            tag("DRYRUN"),
+            olive(format!("{output_name}.nsp"))
+        );
     }
 
     for p in &plan {
         match p {
-            Planned::SkipDelta(name) => inf!("[SKIP] -> Skipping delta fragment: {name}"),
+            Planned::SkipDelta(name) => inf!(
+                "{} -> Skipping delta fragment: {}",
+                tag("SKIP"),
+                olive(name)
+            ),
             Planned::Missing(name) => {
-                crate::err!("Failed to locate NCA file {name} in the NSP file-system.");
+                crate::err!(
+                    "Failed to locate NCA file {} in the NSP file-system.",
+                    olive(name)
+                );
                 return Ok(1);
             }
             Planned::MissingNcz(name) => {
-                crate::err!("Failed to locate NCZ file {name} in the NSP file-system.");
+                crate::err!(
+                    "Failed to locate NCZ file {} in the NSP file-system.",
+                    olive(name)
+                );
                 return Ok(1);
             }
             Planned::DeltaNotFound(name) => {
-                inf!("[SKIP] -> Delta fragment {name} not found in the NSP file-system. Skipping.")
+                inf!(
+                    "{} -> Delta fragment {} not found in the NSP file-system. Skipping.",
+                    tag("SKIP"),
+                    olive(name)
+                )
             }
             Planned::Add(i) => {
                 if settings.dry_run {
-                    inf!("[DRYRUN] -> Would add: {}", ncas[*i].file_name);
+                    inf!(
+                        "{} -> Would add: {}",
+                        tag("DRYRUN"),
+                        olive(&ncas[*i].file_name)
+                    );
                 }
             }
         }
     }
     if settings.dry_run {
-        inf!("[DRYRUN] -> Would add: {}", ncas[meta_idx].file_name);
+        inf!(
+            "{} -> Would add: {}",
+            tag("DRYRUN"),
+            olive(&ncas[meta_idx].file_name)
+        );
     }
 
     let tail = tail_files(
@@ -1501,7 +1553,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     );
     if settings.dry_run {
         for (name, _) in &tail {
-            inf!("[DRYRUN] -> Would add: {name}");
+            inf!("{} -> Would add: {}", tag("DRYRUN"), olive(name));
         }
     }
 
@@ -1515,18 +1567,19 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     }
     if target_name.exists() && !settings.overwrite {
         crate::err!(
-            "File already exists. ({target_str}). Use --overwrite to overwrite an existing file."
+            "File already exists. ({target_str}). Use {} to overwrite an existing file.",
+            grey("--overwrite")
         );
         return Ok(2);
     }
     if settings.dry_run {
         if settings.delete_source {
-            inf!("[DRYRUN] -> Would delete: {file_name}");
+            inf!("{} -> Would delete: {}", tag("DRYRUN"), olive(&file_name));
         }
         return Ok(0);
     }
 
-    inf!("Building Standard NSP => {output_name}");
+    inf!("Building Standard NSP => {}", olive(&output_name));
     let result = match pending {
         Some(p) => p.finish(&target_name, &tail),
         None => PartialNsp::start(
@@ -1542,7 +1595,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         crate::err!("Failed to convert file. {e}");
         return Ok(1);
     }
-    inf!("Converted: {output_name}.nsp");
+    inf!("Converted: {}", olive(format!("{output_name}.nsp")));
 
     if settings.delete_source {
         drop(file);
@@ -1550,7 +1603,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             crate::err!("Failed to delete file. {e}");
             return Ok(1);
         }
-        inf!("Cleaned  : {file_name}");
+        inf!("Cleaned  : {}", olive(&file_name));
     }
 
     Ok(0)
@@ -1583,12 +1636,13 @@ fn import_ticket(
     title_keys: &mut TitleKeys,
     current: &mut Option<Ticket>,
 ) -> Result<()> {
+    let phase = olive("Import tickets");
     if t.rights_id.is_zero() {
-        wrn!("Import tickets - Empty Rights ID. Skipping");
+        wrn!("{phase} - Empty Rights ID. Skipping");
         return Ok(());
     }
     let Some(key) = t.title_key(keys) else {
-        wrn!("Import tickets - TitleKey not found. Skipping");
+        wrn!("{phase} - TitleKey not found. Skipping");
         return Ok(());
     };
     match title_keys.get(&t.rights_id) {
@@ -1598,7 +1652,7 @@ fn import_ticket(
         }
     }
     if current.is_some() {
-        wrn!("Import tickets - Multiple tickets found. Using first.");
+        wrn!("{phase} - Multiple tickets found. Using first.");
         return Ok(());
     }
     *current = Some(t);

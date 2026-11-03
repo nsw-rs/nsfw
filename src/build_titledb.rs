@@ -8,6 +8,7 @@
 //! original tool. `CnmtData` has no `Id` column: the released binary does
 //! not create it, although the class declares one.
 
+use crate::log::{olive, tag};
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use rusqlite::{Connection, params};
@@ -162,7 +163,7 @@ fn region_files(dir: &Path) -> Result<Vec<String>> {
 pub fn run(dir: &Path, clean: bool) -> Result<()> {
     let db_path = dir.join("titledb.db");
     if db_path.exists() && clean {
-        println!("[DONE] Clean old DB.");
+        println!("{} Clean old DB.", tag("DONE"));
         std::fs::remove_file(&db_path)?;
     }
 
@@ -172,7 +173,7 @@ pub fn run(dir: &Path, clean: bool) -> Result<()> {
     // One transaction instead of one per row: same rows, much faster.
     let tx = conn.transaction()?;
 
-    print!("Ingesting: CNMT...");
+    print!("Ingesting: {}...", olive("CNMT"));
     std::io::stdout().flush()?;
     let cnmts: IndexMap<String, IndexMap<String, CnmtJson>> = read_json(&dir.join("cnmts.json"))?;
     {
@@ -188,9 +189,9 @@ pub fn run(dir: &Path, clean: bool) -> Result<()> {
         }
     }
     drop(cnmts);
-    println!("[DONE]");
+    println!("{}", tag("DONE"));
 
-    print!("Ingesting: VERSIONS...");
+    print!("Ingesting: {}...", olive("VERSIONS"));
     std::io::stdout().flush()?;
     let versions: IndexMap<String, IndexMap<String, Option<String>>> =
         read_json(&dir.join("versions.json"))?;
@@ -205,7 +206,7 @@ pub fn run(dir: &Path, clean: bool) -> Result<()> {
         }
     }
     drop(versions);
-    println!("[DONE]");
+    println!("{}", tag("DONE"));
 
     let mut entries: Vec<String> = [
         "US.en", "GB.en", "JP.ja", "DE.de", "FR.fr", "ES.es", "IT.it", "NL.nl", "PT.pt", "KR.ko",
@@ -229,7 +230,7 @@ pub fn run(dir: &Path, clean: bool) -> Result<()> {
         r#"insert into "GameInfo"("NsuId","BannerUrl","Category","Description","Developer","FrontBoxArt","IconUrl","Id","Ids","Intro","IsDemo","Key","Languages","Name","NumberOfPlayers","Publisher","Rating","RatingContent","Region","ReleaseDate","RightsId","Screenshots","Size","Version","RegionLanguage") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
     )?;
     for entry in &entries {
-        print!("Ingesting: {entry}...");
+        print!("Ingesting: {}...", olive(entry));
         std::io::stdout().flush()?;
         let timer = Instant::now();
         let path = Path::new(entry);
@@ -279,12 +280,13 @@ pub fn run(dir: &Path, clean: bool) -> Result<()> {
             count += 1;
         }
         println!(
-            "[DONE] - Added {count} - ({:.2}s)",
+            "{} - Added {count} - ({:.2}s)",
+            tag("DONE"),
             timer.elapsed().as_secs_f64()
         );
     }
     drop((region_stmt, exists_stmt, game_stmt));
     tx.commit()?;
-    println!("[COMPLETE!]");
+    println!("{}", tag("COMPLETE!"));
     Ok(())
 }

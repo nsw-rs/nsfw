@@ -120,6 +120,9 @@ NSZ files (NSPs with compressed `.ncz` NCAs, block or solid) are accepted
 too, also in directory scans. They are reported with a "Compressed NCA"
 warning. See below for converting them to Standard NSP.
 
+Output is colored when it goes to a color terminal. Set `NO_COLOR` to turn
+colors off or `CLICOLOR_FORCE` to force them on. Piped output has no colors.
+
 ### Validate - Example Usage
 
 Validate
