@@ -20,6 +20,18 @@ pub fn is_quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
 }
 
+/// Progress bars are separate from quiet: batch mode hides verbose lines but
+/// still shows progress unless `-q` was given.
+static PROGRESS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_progress(show: bool) {
+    PROGRESS.store(show, Ordering::Relaxed);
+}
+
+pub fn show_progress() -> bool {
+    PROGRESS.load(Ordering::Relaxed)
+}
+
 const OLIVE: u8 = 3;
 const GREY: u8 = 8;
 const GREEN: u8 = 2;

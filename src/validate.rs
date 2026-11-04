@@ -296,12 +296,14 @@ fn verify_npdm(nca: &Nca<impl ReadAt>, tk: &TitleKeys) -> Option<bool> {
 }
 
 fn progress_bar(label: &str, total: u64) -> ProgressBar {
-    let pb = if crate::log::is_quiet() {
-        ProgressBar::hidden()
-    } else {
+    let pb = if crate::log::show_progress() {
         ProgressBar::new(total)
+    } else {
+        ProgressBar::hidden()
     };
-    let template = format!("{label} .. {{bar:40}} {{percent:>3}}% {{eta}}");
+    let template = format!(
+        "{label} .. {{bar:40}} {{bytes}}/{{total_bytes}} {{binary_bytes_per_sec}} {{percent:>3}}% {{eta}}"
+    );
     pb.set_style(ProgressStyle::with_template(&template).unwrap_or(ProgressStyle::default_bar()));
     pb
 }

@@ -289,6 +289,7 @@ fn validate(args: ValidateArgs) -> u8 {
         verify_title: args.verify,
     };
 
+    log::set_progress(!args.quiet);
     if collection.is_empty() {
         log::set_quiet(args.quiet);
         let code = validate::process(&settings, &keys, &nsp);
