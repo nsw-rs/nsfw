@@ -345,11 +345,10 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn collect_nsps_symlinks() {
         use std::os::unix::fs::symlink;

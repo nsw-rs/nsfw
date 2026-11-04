@@ -439,6 +439,8 @@ impl PartialNsp {
             tail_sizes: tail.iter().map(|t| t.1.len() as u64).collect(),
             hashes: HashMap::new(),
         };
+        // Create first: an invalid target fails before any NCA is read.
+        let file = File::create(&p.tmp)?;
         // Each writer is planned once: planning reads the AesCtrEx tables,
         // which for a solid NCZ input means decoding up to them.
         let plain = order
@@ -462,9 +464,7 @@ impl PartialNsp {
         }
 
         let header = p.header(tail);
-        let out = p
-            .out
-            .insert(BufWriter::with_capacity(0x100000, File::create(&p.tmp)?));
+        let out = p.out.insert(BufWriter::with_capacity(0x100000, file));
         out.write_all(&header)?;
         let label = if nsz.is_some() {
             "Compressing"
@@ -559,8 +559,22 @@ impl Drop for PartialNsp {
     }
 }
 
-fn utf16_len(s: &str) -> usize {
-    s.encode_utf16().count()
+/// Refuses output paths over 254 UTF-16 units on Windows, as the original
+/// tool does. std writes longer paths fine (it adds the `\\?\` prefix), but
+/// unless long paths are enabled system wide and per application, most other
+/// programs (Explorer, certutil, PowerShell 5.1) cannot open the result.
+/// Elsewhere the filesystem decides: a name it rejects fails the create of
+/// the `.part` file and is reported then.
+#[cfg(windows)]
+fn path_too_long(target: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    let n = target.as_os_str().encode_wide().count();
+    (n > 254).then(|| format!("Path too long for Windows ({n})"))
+}
+
+#[cfg(not(windows))]
+fn path_too_long(_target: &Path) -> Option<String> {
+    None
 }
 
 pub fn process(settings: &Settings, keys: &Keys, nsp_path: &Path) -> i32 {
@@ -1292,7 +1306,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     // NCA checks below. When conversion is already likely, write the output
     // now so each NCA is read once, for both its hash and the copy.
     // Failed checks later drop the partial file.
-    let target_str = target_name.to_string_lossy().into_owned();
+    let too_long = path_too_long(&target_name);
     let would_convert = settings.convert
         && !settings.dry_run
         && can_proceed
@@ -1307,7 +1321,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         && !plan
             .iter()
             .any(|p| matches!(p, Planned::Missing(_) | Planned::MissingNcz(_)))
-        && utf16_len(&target_str) <= 254
+        && too_long.is_none()
         && !(target_name == nsp_path || is_same_file(&target_name, nsp_path));
     let mut pending = None;
     if would_convert {
@@ -1701,8 +1715,8 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         }
     }
 
-    if utf16_len(&target_str) > 254 {
-        crate::err!("Path too long for Windows ({})", utf16_len(&target_str));
+    if let Some(msg) = too_long {
+        crate::err!("{msg}");
         return Ok(1);
     }
     if target_name == nsp_path || is_same_file(&target_name, nsp_path) {
@@ -1711,7 +1725,8 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     }
     if target_name.exists() && !settings.overwrite {
         crate::err!(
-            "File already exists. ({target_str}). Use {} to overwrite an existing file.",
+            "File already exists. ({}). Use {} to overwrite an existing file.",
+            target_name.display(),
             grey("--overwrite")
         );
         return Ok(2);
