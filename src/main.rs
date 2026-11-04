@@ -57,6 +57,10 @@ struct ValidateArgs {
     /// Convert to Standardised NSP.
     #[arg(short = 's', long = "standard")]
     standard: bool,
+    /// Convert to Standardised NSZ: the Standard NSP with its program and
+    /// public data NCAs compressed to NCZ (implies --standard).
+    #[arg(short = 'S', long = "nsz")]
+    nsz: bool,
     /// Path to standardised NSP output directory.
     #[arg(short = 'o', long = "nspdir", default_value = "./nsp")]
     nspdir: String,
@@ -227,7 +231,8 @@ fn validate(args: ValidateArgs) -> u8 {
             return 1;
         }
     };
-    if args.standard
+    let convert = args.standard || args.nsz;
+    if convert
         && !nsp_dir.is_dir()
         && let Err(e) = std::fs::create_dir_all(&nsp_dir)
     {
@@ -267,7 +272,8 @@ fn validate(args: ValidateArgs) -> u8 {
     let settings = validate::Settings {
         cert: cert.map(std::cell::OnceCell::from).unwrap_or_default(),
         cert_path,
-        convert: args.standard,
+        convert,
+        nsz: args.nsz,
         nsp_dir,
         dry_run: args.dryrun,
         language_mode,

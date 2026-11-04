@@ -204,6 +204,32 @@ the decompressed NSP.
 
 ---
 
+### Create "Standard NSZ" (`v -S`) - Example Usage
+
+An extension of this port, not in NSFW. Builds the Standard NSP, then
+compresses its program and public data NCAs to NCZ the way nsz does (other
+NCAs, like the CNMT and control NCAs, stay uncompressed), and writes it as
+`.nsz`. `-S` implies `-s` and converts even when the input is already a
+Standard NSP.
+
+Decompressing a Standard NSZ (`v -s --force-convert`, or a `fuse-nsz`
+mount) gives back the Standard NSP byte for byte, so it can be checked
+against the same DATs.
+
+The NSZ bytes are reproducible too: the same input always gives the same
+NSZ, whatever the number of CPUs, because the compression settings (zstd
+1.5.5, level 19) are fixed. They differ from what nsz writes for the same
+NSP.
+
+`./nsfw v -S <PATH_TO_NSP_FILE>`
+
+Each NCA is compressed in 1 MiB blocks, which keep random access (needed
+to mount it with `fuse-nsz`).
+
+See [Standard NSZ](StandardNSZ.md) for the format.
+
+---
+
 ## Build TitleDB (`build-titledb`)
 
 Builds `titledb.db` from a checkout of

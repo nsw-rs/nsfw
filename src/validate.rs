@@ -17,7 +17,7 @@ use libhac::cnmt::{self, Cnmt, ContentAttributes, MetaType};
 use libhac::keys::Keys;
 use libhac::nacp::Nacp;
 use libhac::nca::{ContentType, DistributionType, FsType, Nca, SectionIndex, TitleKeys};
-use libhac::ncz::NczReader;
+use libhac::ncz::{NczReader, NczWriter};
 use libhac::partition::PartitionFs;
 use libhac::pfs0::Pfs0Builder;
 use libhac::romfs::RomFs;
@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const COMMON_CERT_SIZE: usize = 0x700;
@@ -60,6 +60,9 @@ pub struct Settings {
     /// Where the common certificate is cached when it is taken from an NSP.
     pub cert_path: PathBuf,
     pub convert: bool,
+    /// Write a Standard NSZ instead: the Standard NSP with its program and
+    /// public data NCAs compressed to NCZ.
+    pub nsz: bool,
     pub nsp_dir: PathBuf,
     pub dry_run: bool,
     pub language_mode: LanguageMode,
@@ -140,6 +143,16 @@ impl FsNca<'_> {
         self.file_name
             .strip_suffix(".ncz")
             .unwrap_or(&self.file_name)
+    }
+
+    /// The NCA this entry stands for: for an `.ncz` entry, the
+    /// decompressed one.
+    fn plain_nca(&self, keys: &Keys) -> Result<Nca<Box<dyn ReadAt + '_>>> {
+        let s: Box<dyn ReadAt + '_> = match &self.ncz {
+            Some(z) => Box::new(z),
+            None => Box::new(*self.nca.storage()),
+        };
+        Ok(Nca::open(keys, s)?)
     }
 
     /// Name and size of this NCA in the Standard NSP.
@@ -399,6 +412,10 @@ fn cache_common_cert(settings: &Settings, cert: Vec<u8>) {
 struct PartialNsp {
     tmp: PathBuf,
     out: Option<BufWriter<File>>,
+    /// Files before the tail, with their written sizes. For an NSZ the
+    /// sizes are known only once the files are written, so `finish`
+    /// writes the header again.
+    files: Vec<(String, u64)>,
     tail_sizes: Vec<u64>,
     /// Upper-case hex SHA256 of each written NCA, by file name.
     hashes: HashMap<String, String>,
@@ -407,45 +424,76 @@ struct PartialNsp {
 impl PartialNsp {
     fn start(
         target: &Path,
-        src: &dyn ReadAt,
+        keys: &Keys,
         ncas: &[FsNca],
         order: &[usize],
         tail: &[(String, Vec<u8>)],
+        nsz: Option<&TitleKeys>,
     ) -> Result<Self> {
         let mut tmp = target.as_os_str().to_owned();
         tmp.push(".part");
         let mut p = PartialNsp {
             tmp: tmp.into(),
             out: None,
+            files: Vec::new(),
             tail_sizes: tail.iter().map(|t| t.1.len() as u64).collect(),
             hashes: HashMap::new(),
         };
-        let mut layout = Pfs0Builder::new();
+        // Each writer is planned once: planning reads the AesCtrEx tables,
+        // which for a solid NCZ input means decoding up to them.
+        let plain = order
+            .iter()
+            .map(|&i| ncas[i].plain_nca(keys))
+            .collect::<Result<Vec<_>>>()?;
+        let mut writers = Vec::new();
         let mut total = 0;
-        for &i in order {
-            let (name, size) = ncas[i].output()?;
-            layout.add_file(name.as_str(), size);
+        for (&i, nca) in order.iter().zip(&plain) {
+            let (mut name, size) = ncas[i].output()?;
+            let w = match nsz {
+                Some(tk) => ncz_writer(nca, tk)?,
+                None => None,
+            };
+            if w.is_some() {
+                name = format!("{}.ncz", name.strip_suffix(".nca").unwrap_or(&name));
+            }
+            p.files.push((name, size));
+            writers.push(w);
             total += size;
         }
-        for (n, b) in tail {
-            layout.add_file(n.as_str(), b.len() as u64);
-        }
 
+        let header = p.header(tail);
         let out = p
             .out
             .insert(BufWriter::with_capacity(0x100000, File::create(&p.tmp)?));
-        out.write_all(&layout.to_bytes())?;
-        let pb = progress_bar("Writing", total);
-        for &i in order {
+        out.write_all(&header)?;
+        let label = if nsz.is_some() {
+            "Compressing"
+        } else {
+            "Writing"
+        };
+        let pb = progress_bar(label, total);
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        for (k, &i) in order.iter().enumerate() {
             let mut sha = Sha256::new();
-            let mut copy = |chunk: &[u8]| {
+            // Every NCA byte goes here once, in order.
+            let mut seen = |chunk: &[u8]| {
                 sha.update(chunk);
-                out.write_all(chunk)?;
                 pb.inc(chunk.len() as u64);
-                Ok(())
             };
-            if let Some(z) = &ncas[i].ncz {
-                z.read_chunks(0, z.size()?, &mut copy)?;
+            p.files[k].1 = match &writers[k] {
+                Some(w) => w.write(out, threads, &mut seen)?,
+                None => {
+                    let src = plain[k].storage();
+                    let size = src.size()?;
+                    src.read_chunks(0, size, &mut |chunk| {
+                        seen(chunk);
+                        out.write_all(chunk)?;
+                        Ok(())
+                    })?;
+                    size
+                }
+            };
+            if ncas[i].ncz.is_some() {
                 let current = hex::encode_upper(&sha.finalize()[..16]);
                 let target = ncas[i].ncz_target_hash().to_uppercase();
                 if current != target {
@@ -455,8 +503,6 @@ impl PartialNsp {
                 }
                 continue;
             }
-            let r = ncas[i].nca.storage();
-            src.read_chunks(r.offset(), r.size()?, &mut copy)?;
             p.hashes
                 .insert(ncas[i].file_name.clone(), hex::encode_upper(sha.finalize()));
         }
@@ -476,10 +522,34 @@ impl PartialNsp {
         for (_, bytes) in tail {
             out.write_all(bytes)?;
         }
+        out.seek(SeekFrom::Start(0))?;
+        out.write_all(&self.header(tail))?;
         out.into_inner().map_err(|e| e.into_error())?;
         std::fs::rename(&self.tmp, target)?;
         Ok(())
     }
+
+    /// The PFS0 header of the files and `tail`.
+    fn header(&self, tail: &[(String, Vec<u8>)]) -> Vec<u8> {
+        let mut layout = Pfs0Builder::new();
+        for (n, size) in &self.files {
+            layout.add_file(n.as_str(), *size);
+        }
+        for (n, b) in tail {
+            layout.add_file(n.as_str(), b.len() as u64);
+        }
+        layout.to_bytes()
+    }
+}
+
+/// The NCZ writer of `nca` when nsz would compress it: program and public
+/// data NCAs only.
+fn ncz_writer<'a, S: ReadAt>(nca: &'a Nca<S>, tk: &TitleKeys) -> Result<Option<NczWriter<'a, S>>> {
+    let ct = nca.content_type();
+    if ct != ContentType::PROGRAM && ct != ContentType::PUBLIC_DATA {
+        return Ok(None);
+    }
+    Ok(NczWriter::new(nca, tk)?)
 }
 
 impl Drop for PartialNsp {
@@ -1191,12 +1261,12 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         keep_name: settings.keep_name,
     });
 
-    let output_file = format!("{output_name}.nsp");
+    let output_file = format!("{output_name}.{}", if settings.nsz { "nsz" } else { "nsp" });
     if settings.convert && !naming::is_plain_file_name(&output_file) {
         ftl!("Invalid output file name ({output_file}).");
         return Ok(1);
     }
-    let target_name = settings.nsp_dir.join(output_file);
+    let target_name = settings.nsp_dir.join(&output_file);
     if settings.convert && target_name.exists() && !settings.overwrite {
         ftl!(
             "File already exists. ({}). Use {} to overwrite an existing file.",
@@ -1228,6 +1298,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         && can_proceed
         && !(settings.exit_on_error && !errors.is_empty())
         && (settings.force_convert
+            || settings.nsz
             || generate_new_ticket
             || has_loose_files
             || !is_file_order_correct
@@ -1246,7 +1317,15 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             ticket.as_ref().filter(|_| has_title_key_crypto),
             settings.cert.get(),
         ) {
-            pending = PartialNsp::start(&target_name, &whole, &ncas, &order, &tail).ok();
+            pending = PartialNsp::start(
+                &target_name,
+                keys,
+                &ncas,
+                &order,
+                &tail,
+                settings.nsz.then_some(&title_keys),
+            )
+            .ok();
         }
     }
 
@@ -1554,16 +1633,12 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     }
 
     // CONVERT
-    if is_standard_nsp && !settings.force_convert {
+    if is_standard_nsp && !settings.force_convert && !settings.nsz {
         inf!("File is already in Standard NSP format. Skipping conversion.");
         return Ok(0);
     }
     if settings.dry_run {
-        inf!(
-            "{} -> Would create: {}",
-            tag("DRYRUN"),
-            olive(format!("{output_name}.nsp"))
-        );
+        inf!("{} -> Would create: {}", tag("DRYRUN"), olive(&output_file));
     }
 
     for p in &plan {
@@ -1648,15 +1723,17 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         return Ok(0);
     }
 
-    inf!("Building Standard NSP => {}", olive(&output_name));
+    let kind = if settings.nsz { "NSZ" } else { "NSP" };
+    inf!("Building Standard {kind} => {}", olive(&output_name));
     let result = match pending {
         Some(p) => p.finish(&target_name, &tail),
         None => PartialNsp::start(
             &target_name,
-            &whole,
+            keys,
             &ncas,
             &output_order(&plan, meta_idx),
             &tail,
+            settings.nsz.then_some(&title_keys),
         )
         .and_then(|p| p.finish(&target_name, &tail)),
     };
@@ -1664,7 +1741,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         crate::err!("Failed to convert file. {e}");
         return Ok(1);
     }
-    inf!("Converted: {}", olive(format!("{output_name}.nsp")));
+    inf!("Converted: {}", olive(&output_file));
 
     if settings.delete_source {
         drop(file);

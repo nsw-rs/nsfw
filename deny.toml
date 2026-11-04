@@ -18,6 +18,9 @@ ignore = [
     # personalised ticket title key with the user's own eTicket key, so an
     # attacker has no timing oracle. No fixed rsa release exists yet.
     { id = "RUSTSEC-2023-0071", reason = "no remote timing oracle in an offline CLI" },
+    # zstd-sys before 2.0.10 on wasm32 only. libhac pins this exact libzstd
+    # so the Standard NSZ output stays the same, and wasm32 is not a target.
+    { id = "RUSTSEC-2026-0410", reason = "wasm32 only; pin needed for reproducible NSZ output" },
 ]
 
 # ---------------------------------------------------------------------------
