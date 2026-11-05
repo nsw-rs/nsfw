@@ -91,10 +91,10 @@ See [Standard NSP](StandardNSP.md), the format description from NSFW.
 ```
 Validate NSP files, optionally converting them to Standard NSP
 
-Usage: nsfw validate [OPTIONS] <NSP>
+Usage: nsfw validate [OPTIONS] <NSP>...
 
 Arguments:
-  <NSP>  Path to NSP file or directory
+  <NSP>...  Paths to NSP files or directories
 
 Options:
   -k, --keys <KEYS>        Path to NSW keys file [default: ~/.switch/prod.keys]
@@ -159,6 +159,16 @@ Batch verification - Process 10 files, skipping the first 20, and stop at
 the first error.
 
 `./nsfw v -b 10 --skip 20 -e <PATH_TO_NSP_DIRECTORY>`
+
+Batch verification of several files or directories - An extension of this
+port, not in NSFW (which takes one path). The files of each directory are
+sorted as in a single directory scan, and the paths are processed in the
+order given. More than one path always runs in batch mode. A file reached
+through more than one argument is processed once. A missing path is reported
+and skipped (with `-e` it stops the run). In batch mode the exit code is the
+worst one over all files, not the one of the last file as in NSFW.
+
+`./nsfw v <PATH_TO_NSP_FILE> <PATH_TO_NSP_DIRECTORY> ...`
 
 ---
 

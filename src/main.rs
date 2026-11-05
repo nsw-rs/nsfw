@@ -132,8 +132,9 @@ struct ValidateArgs {
     /// Check headers and padding of NCA files.
     #[arg(short = 'H', long = "check-padding")]
     check_padding: bool,
-    /// Path to NSP file or directory.
-    nsp: String,
+    /// Paths to NSP files or directories.
+    #[arg(required = true)]
+    nsp: Vec<String>,
 }
 
 /// Expand a leading `~` only; a `~` elsewhere in the path is a literal.
@@ -169,7 +170,10 @@ fn full_path(p: &str) -> PathBuf {
 /// A directory that resolves to one of its own ancestors is skipped, so a
 /// symlink loop ends instead of recursing until the stack overflows.
 fn collect_nsps(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    collect_nsps_in(dir, &mut Vec::new(), out)
+    let start = out.len();
+    collect_nsps_in(dir, &mut Vec::new(), out)?;
+    out[start..].sort_by_cached_key(|p| ordinal_ignore_case_key(p));
+    Ok(())
 }
 
 fn collect_nsps_in(
@@ -203,37 +207,64 @@ fn collect_nsps_in(
     Ok(())
 }
 
+/// .NET `StringComparer.OrdinalIgnoreCase` sort key: simple (single char)
+/// uppercase mapping, compared as UTF-16 code units.
+fn ordinal_ignore_case_key(p: &Path) -> Vec<u16> {
+    let upper: String = p
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            let mut u = c.to_uppercase();
+            match (u.next(), u.next()) {
+                (Some(x), None) => x,
+                _ => c,
+            }
+        })
+        .collect();
+    upper.encode_utf16().collect()
+}
+
 fn validate(args: ValidateArgs) -> u8 {
     let keys_path = PathBuf::from(expand_home(&args.keys));
     let cert_path = PathBuf::from(expand_home(&args.cert));
-    let nsp = PathBuf::from(expand_home(&args.nsp));
     let nsp_dir = full_path(&expand_home(&args.nspdir));
 
+    // One file argument keeps the single file mode of the C# tool; anything
+    // else (a directory, or several paths) runs in batch mode.
+    let one_arg = args.nsp.len() == 1;
+    let mut single = None;
     let mut collection = Vec::new();
-    if nsp.is_dir() {
-        if let Err(e) = collect_nsps(&nsp, &mut collection) {
-            eprintln!("Error: failed to list {}: {e}", nsp.display());
-            return 1;
+    let mut missing = false;
+    for arg in &args.nsp {
+        let nsp = PathBuf::from(expand_home(arg));
+        if nsp.is_dir() {
+            if let Err(e) = collect_nsps(&nsp, &mut collection) {
+                eprintln!("Error: failed to list {}: {e}", nsp.display());
+                return 1;
+            }
+        } else if nsp.is_file() {
+            if one_arg {
+                single = Some(nsp);
+            } else {
+                collection.push(nsp);
+            }
+        } else {
+            eprintln!("Error: NSP file '{}' does not exist.", nsp.display());
+            // One path keeps the C# behavior. With several, the others are
+            // still processed and the run ends with an error code.
+            if one_arg || args.exit_on_error {
+                return 1;
+            }
+            missing = true;
         }
-        // .NET StringComparer.OrdinalIgnoreCase: simple (single char)
-        // uppercase mapping, compared as UTF-16 code units.
-        collection.sort_by_cached_key(|p| {
-            let upper: String = p
-                .to_string_lossy()
-                .chars()
-                .map(|c| {
-                    let mut u = c.to_uppercase();
-                    match (u.next(), u.next()) {
-                        (Some(x), None) => x,
-                        _ => c,
-                    }
-                })
-                .collect();
-            upper.encode_utf16().collect::<Vec<u16>>()
-        });
-    } else if !nsp.is_file() {
-        eprintln!("Error: NSP file '{}' does not exist.", nsp.display());
-        return 1;
+    }
+    // Overlapping arguments (a directory and a file inside it, or the same
+    // path twice) must not process a file twice: a second pass would fail on
+    // an output that exists, or on a source that `-Z` already deleted. One
+    // directory is left as scanned, like the C# tool.
+    if !one_arg {
+        let mut seen = std::collections::HashSet::new();
+        collection.retain(|p| seen.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())));
     }
     if !keys_path.is_file() {
         eprintln!("Error: Keys file '{}' does not exist.", keys_path.display());
@@ -266,7 +297,7 @@ fn validate(args: ValidateArgs) -> u8 {
         eprintln!("Error: Common cert '{}' is invalid.", cert_path.display());
         return 1;
     }
-    if nsp.is_dir() && collection.is_empty() {
+    if single.is_none() && collection.is_empty() {
         eprintln!("Error: No NSP files found.");
         return 1;
     }
@@ -312,7 +343,7 @@ fn validate(args: ValidateArgs) -> u8 {
     };
 
     log::set_progress(!args.quiet);
-    if collection.is_empty() {
+    if let Some(nsp) = single {
         log::set_quiet(args.quiet);
         let code = validate::process(&settings, &keys, &nsp);
         return code as u8;
@@ -326,16 +357,19 @@ fn validate(args: ValidateArgs) -> u8 {
     }
     let total = files.len();
     println!("Processing {total} NSPs ..");
-    let mut code = 0;
+    // The worst code over all files, so a failure is never hidden by a later
+    // success.
+    let mut worst = i32::from(missing);
     for (i, f) in files.iter().enumerate() {
-        code = validate::process(&settings, &keys, f);
+        let code = validate::process(&settings, &keys, f);
         if args.exit_on_error && code != 0 {
             ftl!("Exiting on first error..");
             return code as u8;
         }
+        worst = worst.max(code);
         println!("----- [{}/{total}] -----", i + 1);
     }
-    code as u8
+    worst as u8
 }
 
 fn query(args: QueryArgs) -> u8 {
