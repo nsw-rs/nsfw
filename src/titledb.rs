@@ -4,9 +4,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! TitleDB lookups: port of the `GetTitleDbInfo`, `LookUpTitle`,
-//! `LookUpReleaseDate`, `LookupLanguages` and `LookUpRegions` helpers from
-//! `NsfwUtilities`. The queries match the SQL the original ORM emits (no
-//! ORDER BY), so rows come back in the same order before the stable sorts.
+//! `LookUpReleaseDate`, `LookupLanguages`, `LookUpRegions`, `LookUpUpdates`
+//! and `LookUpRelatedTitles` helpers from `NsfwUtilities`. The queries match
+//! the SQL the original ORM emits (no ORDER BY), so rows come back in the
+//! same order before the stable sorts.
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OpenFlags, params};
@@ -18,11 +19,18 @@ pub struct TitleDb {
     conn: Connection,
 }
 
-struct GameRow {
-    name: Option<String>,
-    release_date: Option<i64>,
-    region_language: Option<String>,
+pub struct GameRow {
+    pub name: Option<String>,
+    pub release_date: Option<i64>,
+    pub region_language: Option<String>,
+    pub publisher: Option<String>,
+    pub description: Option<String>,
+    /// A NULL reads as 0, like the original's `long` property.
+    pub nsu_id: i64,
 }
+
+const GAME_COLUMNS: &str =
+    "\"Name\", \"ReleaseDate\", \"RegionLanguage\", \"Publisher\", \"Description\", \"NsuId\"";
 
 /// Position in `order`, -1 when missing (.NET `List.IndexOf`).
 fn index_of(order: &[&str], s: Option<&str>) -> i32 {
@@ -43,6 +51,9 @@ impl TitleDb {
                 name: r.get(0)?,
                 release_date: r.get(1)?,
                 region_language: r.get(2)?,
+                publisher: r.get(3)?,
+                description: r.get(4)?,
+                nsu_id: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -50,7 +61,7 @@ impl TitleDb {
 
     /// Rows for `title_id`, falling back to a substring match on `Ids`,
     /// sorted by preferred language.
-    fn game_info(&self, title_id: &str) -> Result<Vec<GameRow>> {
+    pub fn game_info(&self, title_id: &str) -> Result<Vec<GameRow>> {
         const ORDER: &[&str] = &[
             "en", "ja", "de", "fr", "es", "it", "nl", "pt", "ko", "tw", "cn", "zh", "ru",
         ];
@@ -61,12 +72,12 @@ impl TitleDb {
         )?;
         let mut rows = if count == 0 {
             self.game_rows(
-                "select \"Name\", \"ReleaseDate\", \"RegionLanguage\" from \"GameInfo\" where (\"Ids\" like ('%' || (?) || '%'))",
+                &format!("select {GAME_COLUMNS} from \"GameInfo\" where (\"Ids\" like ('%' || (?) || '%'))"),
                 title_id,
             )?
         } else {
             self.game_rows(
-                "select \"Name\", \"ReleaseDate\", \"RegionLanguage\" from \"GameInfo\" where (\"Id\" = (?))",
+                &format!("select {GAME_COLUMNS} from \"GameInfo\" where (\"Id\" = (?))"),
                 title_id,
             )?
         };
@@ -149,13 +160,10 @@ impl TitleDb {
                 nsu_ids.push(id);
             }
         }
-        let mut stmt = self
-            .conn
-            .prepare_cached("select \"Region\" from \"TitleRegion\" where (\"NsuId\" = (?))")?;
         let mut regions: Vec<String> = Vec::new();
         for nsu_id in nsu_ids {
-            for r in stmt.query_map(params![nsu_id], |r| r.get::<_, Option<String>>(0))? {
-                let r = r?.unwrap_or_default().to_uppercase();
+            for r in self.nsu_regions(nsu_id)? {
+                let r = r.to_uppercase();
                 if !regions.contains(&r) {
                     regions.push(r);
                 }
@@ -163,17 +171,64 @@ impl TitleDb {
         }
         Ok(distribution_region(&regions.join(",")).to_string())
     }
+
+    /// `TitleRegion` rows of one eShop entry, as stored.
+    pub fn nsu_regions(&self, nsu_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("select \"Region\" from \"TitleRegion\" where (\"NsuId\" = (?))")?;
+        let rows = stmt.query_map(params![nsu_id], |r| r.get::<_, Option<String>>(0))?;
+        rows.map(|r| Ok(r?.unwrap_or_default())).collect()
+    }
+
+    /// Known updates of `title_id` as (version, release date).
+    pub fn updates(&self, title_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "select \"Version\", \"ReleaseDate\" from \"TitleVersions\" where (\"TitleId\" = (?))",
+        )?;
+        let rows = stmt.query_map(params![title_id.to_lowercase()], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Titles whose ID shares all but the last three characters of
+    /// `title_id` (base, update, DLCs), as `[Id] Name`. The prefix match is
+    /// case-sensitive, like the original's `StartsWith` translation.
+    pub fn related_titles(&self, title_id: &str) -> Result<Vec<String>> {
+        let n = title_id.chars().count().saturating_sub(3);
+        let prefix: String = title_id.chars().take(n).collect();
+        let mut stmt = self.conn.prepare_cached(
+            "select \"Id\", \"Name\" from \"GameInfo\" where (substr(\"Id\", 1, (?)) = (?))",
+        )?;
+        let rows = stmt.query_map(params![n as i64, prefix], |r| {
+            let id: Option<String> = r.get(0)?;
+            let name: Option<String> = r.get(1)?;
+            Ok(format!(
+                "[{}] {}",
+                id.unwrap_or_default(),
+                name.map(|n| clean_title(&remove_brackets(&n)))
+                    .unwrap_or_default()
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
+/// eShop region prefixes, shared with the `query` region classifier.
+pub const AMERICAS: &[&str] = &["US.", "CA.", "MX."];
+pub const EUROPE: &[&str] = &[
+    "GB.", "DE.", "FR.", "ES.", "IT.", "PT.", "CH.", "HU.", "LT.", "BE.", "BG.", "EE.", "LU.",
+    "HR.", "SI.", "AT.", "GR.", "NO.", "DK.", "CZ.", "RO.", "ZA.", "NZ.", "LV.", "SK.", "SE.",
+    "FI.", "IE.", "AU.", "MT.", "CY.",
+];
+pub const ASIA: &[&str] = &["HK.", "KR.", "JP"];
+
 fn distribution_region(list: &str) -> &'static str {
-    const AMERICAS: &[&str] = &["US.", "CA.", "MX."];
     const LATIN_AMERICA: &[&str] = &["BR.", "AR.", "CL.", "CO.", "CR.", "EC.", "GT.", "PE."];
-    const EUROPE: &[&str] = &[
-        "GB.", "DE.", "FR.", "ES.", "IT.", "PT.", "CH.", "HU.", "LT.", "BE.", "BG.", "EE.", "LU.",
-        "HR.", "SI.", "AT.", "GR.", "NO.", "DK.", "CZ.", "RO.", "ZA.", "NZ.", "LV.", "SK.", "SE.",
-        "FI.", "IE.", "AU.", "MT.", "CY.",
-    ];
-    const ASIA: &[&str] = &["HK.", "KR.", "JP"];
 
     let mut region = "UNKNOWN";
     let mut matches = 0;

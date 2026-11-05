@@ -77,6 +77,10 @@ pub struct Settings {
     /// Absolute path of `titledb.db`; TitleDB is used only when it exists.
     pub titledb: PathBuf,
     pub verify_title: bool,
+    /// Rename the NSP in place to its Standard name, nothing else.
+    pub rename: bool,
+    /// Skip the NCA hash checks (meant to make `rename` fast).
+    pub skip_hash: bool,
 }
 
 /// Errors and warnings keep insertion order and drop duplicates (C# HashSet).
@@ -561,22 +565,77 @@ impl Drop for PartialNsp {
     }
 }
 
-/// Refuses output paths over 254 UTF-16 units on Windows, as the original
-/// tool does. std writes longer paths fine (it adds the `\\?\` prefix), but
-/// unless long paths are enabled system wide and per application, most other
-/// programs (Explorer, certutil, PowerShell 5.1) cannot open the result.
+/// Refuses output paths over `limit` UTF-16 units on Windows, as the
+/// original tool does (254 for conversion, 258 for rename). std writes
+/// longer paths fine (it adds the `\\?\` prefix), but unless long paths are
+/// enabled system wide and per application, most other programs (Explorer,
+/// certutil, PowerShell 5.1) cannot open the result.
 /// Elsewhere the filesystem decides: a name it rejects fails the create of
 /// the `.part` file and is reported then.
 #[cfg(windows)]
-fn path_too_long(target: &Path) -> Option<String> {
+fn path_too_long(target: &Path, limit: usize) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     let n = target.as_os_str().encode_wide().count();
-    (n > 254).then(|| format!("Path too long for Windows ({n})"))
+    (n > limit).then(|| format!("Path too long for Windows ({n})"))
 }
 
 #[cfg(not(windows))]
-fn path_too_long(_target: &Path) -> Option<String> {
+fn path_too_long(_target: &Path, _limit: usize) -> Option<String> {
     None
+}
+
+/// File name for the renamed NSP: the Standard name plus the source
+/// extension, so an NSZ stays an NSZ (the original always used `.nsp`).
+fn rename_file_name(file_name: &str, output_name: &str) -> String {
+    let is_nsz = Path::new(file_name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("nsz"));
+    format!("{output_name}.{}", if is_nsz { "nsz" } else { "nsp" })
+}
+
+/// RENAME: move the NSP to its Standard name in the same directory.
+fn rename(settings: &Settings, nsp_path: &Path, file_name: &str, output_name: &str) -> i32 {
+    let new_name = rename_file_name(file_name, output_name);
+    if file_name == new_name {
+        inf!("Renaming skipped. Nothing to do. Filename matches already.");
+        return 0;
+    }
+    if !naming::is_plain_file_name(&new_name) {
+        ftl!("Invalid output file name ({new_name}).");
+        return 1;
+    }
+    let target = nsp_path.with_file_name(&new_name);
+    if let Some(msg) = path_too_long(
+        &std::path::absolute(&target).unwrap_or_else(|_| target.clone()),
+        258,
+    ) {
+        crate::err!("{msg}");
+        return 1;
+    }
+    // A case-only rename on a case-insensitive filesystem finds the source.
+    // Any other existing entry (including a dangling symlink, a symlink to
+    // the source or a hard link of it, which rename would leave in place)
+    // needs --overwrite.
+    let case_only =
+        file_name.to_lowercase() == new_name.to_lowercase() && is_same_file(&target, nsp_path);
+    if target.symlink_metadata().is_ok() && !settings.overwrite && !case_only {
+        crate::err!(
+            "File with the same name already exists. ({new_name}). Use {} to overwrite an existing file.",
+            grey("--overwrite")
+        );
+        return 2;
+    }
+    if settings.dry_run {
+        inf!("{} -> Rename FROM: {}", tag("DRYRUN"), olive(file_name));
+        inf!("{} ->   Rename TO: {}", tag("DRYRUN"), olive(&new_name));
+        return 0;
+    }
+    if let Err(e) = std::fs::rename(nsp_path, &target) {
+        crate::err!("Failed to rename file. {e}");
+        return 1;
+    }
+    inf!("Renamed TO: {}", olive(output_name));
+    0
 }
 
 pub fn process(settings: &Settings, keys: &Keys, nsp_path: &Path) -> i32 {
@@ -644,6 +703,14 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         }
         None
     };
+    if settings.rename {
+        let extra = if settings.dry_run {
+            format!(" ({})", olive("Dry Run"))
+        } else {
+            String::new()
+        };
+        inf!("Output Mode <- {}{extra}", green("RENAME"));
+    }
 
     let mut phase = olive("Validate File Structure");
     let file = File::open(nsp_path)?;
@@ -1308,7 +1375,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     // NCA checks below. When conversion is already likely, write the output
     // now so each NCA is read once, for both its hash and the copy.
     // Failed checks later drop the partial file.
-    let too_long = path_too_long(&target_name);
+    let too_long = path_too_long(&target_name, 254);
     let would_convert = settings.convert
         && !settings.dry_run
         && can_proceed
@@ -1403,6 +1470,12 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             }
         }
 
+        if settings.skip_hash {
+            warnings.add(format!("{phase} - Skipped hash check on : {name}."));
+            nca_files.push(info);
+            continue;
+        }
+
         let headers_valid = nca_files.iter().all(|n| n.header_valid);
         if settings.force_hash || (!info.is_errored() && headers_valid) {
             if settings.force_hash {
@@ -1471,7 +1544,13 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         && !copy_new_cert
         && !bad_padding;
 
-    if errors.is_empty()
+    if settings.skip_hash && !settings.rename {
+        inf!(
+            "{} <- {}",
+            olive("Validation Complete"),
+            olive("Unknown - Hashing skipped.")
+        );
+    } else if errors.is_empty()
         && header_signature_valid
         && !copy_new_cert
         && nca_files.iter().all(|n| !n.is_errored())
@@ -1626,6 +1705,12 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     if !can_proceed {
         ftl!("NSP Validation failed.");
         return Ok(1);
+    }
+    if settings.rename {
+        // Windows cannot rename a file that is still open.
+        drop(ncas);
+        drop(file);
+        return Ok(rename(settings, nsp_path, &file_name, &output_name));
     }
     if !settings.convert {
         return Ok(0);
@@ -1825,6 +1910,19 @@ fn import_ticket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_keeps_extension() {
+        assert_eq!(rename_file_name("x.nsp", "Game [01]"), "Game [01].nsp");
+        assert_eq!(rename_file_name("x.nsz", "Game [01]"), "Game [01].nsz");
+        assert_eq!(rename_file_name("x.NSZ", "Game [01]"), "Game [01].nsz");
+        assert_eq!(rename_file_name("x.nsx", "Game [01]"), "Game [01].nsp");
+        // Already named: rename() compares this with the source name.
+        assert_eq!(
+            rename_file_name("Game [01].nsp", "Game [01]"),
+            "Game [01].nsp"
+        );
+    }
 
     #[test]
     fn swapped_common_cert_rejects_other_data() {

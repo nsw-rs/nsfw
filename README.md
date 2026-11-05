@@ -17,7 +17,7 @@ the deterministic "Standard NSP" format, so that they can be accurately
 verified and preserved.
 
 The port covers the `validate` command (including Standard NSP conversion
-and TitleDB lookups) and `build-titledb`. Output file names, verdicts and the
+and TitleDB lookups), `query` and `build-titledb`. Output file names, verdicts and the
 bytes of converted NSPs are identical to those of NSFW 0.1.184. It is a
 single self-contained binary: no .NET runtime is needed.
 
@@ -100,6 +100,9 @@ Options:
   -k, --keys <KEYS>        Path to NSW keys file [default: ~/.switch/prod.keys]
   -c, --cert <CERT>        Path to 0x700-byte long common certificate chain file (created from the NSP if missing) [default: ~/.switch/common.cert]
   -s, --standard           Convert to Standardised NSP
+  -S, --nsz                Convert to Standardised NSZ: the Standard NSP with its program and public data NCAs compressed to NCZ (implies --standard)
+  -r, --rename             Rename NSP to match TitleDB. No other actions performed
+      --skip-hash          When re-naming files, skip NCA hash validation
   -o, --nspdir <NSPDIR>    Path to standardised NSP output directory [default: ./nsp]
   -d, --dryrun             Prints actions to be performed but does not execute any of them
       --nl                 Do not include any languages in output filename
@@ -230,6 +233,53 @@ See [Standard NSZ](StandardNSZ.md) for the format.
 
 ---
 
+### Rename to the Standard name (`v -r`) - Example Usage
+
+Renames the NSP in place to the name a Standard NSP conversion would give it
+(TitleDB is used when found). Nothing else is changed. An NSZ keeps its
+`.nsz` extension. A file that fails validation is not renamed, and an
+existing file with the target name is replaced only with `--overwrite`.
+
+`./nsfw v -r <PATH_TO_NSP_FILE_OR_DIRECTORY>`
+
+Rename - Dry run, only show the new name
+
+`./nsfw v -r -d <PATH_TO_NSP_FILE>`
+
+Rename - Fast, skip the NCA hash checks, verify the title against TitleDB
+
+`./nsfw v -r --skip-hash -y <PATH_TO_NSP_FILE>`
+
+`--skip-hash` also works without `-r`, but then the result of the validation
+is reported as unknown. It cannot be used with `-s` or `-S` (the C# tool
+allows it), so a conversion never copies NCAs that were not hash checked.
+
+---
+
+## Query TitleDB (`q`)
+
+Prints the TitleDB entry of a title ID: name, publisher, description, the
+title in each region, the eShop entries with their regions, the known updates
+and the related titles (base, update, DLCs). An update ID (ending in `800`)
+is looked up through its base title.
+
+```
+Look up a title ID in TitleDB
+
+Usage: nsfw query [OPTIONS] <TITLEID>
+
+Arguments:
+  <TITLEID>  Title ID to search for
+
+Options:
+      --titledb <TITLEDB>  Path to titledb.db file [default: ./titledb/titledb.db]
+  -h, --help               Print help
+```
+
+`./nsfw q 0100566015AD2000`
+
+---
+
 ## Build TitleDB (`build-titledb`)
 
 Builds `titledb.db` from a checkout of
@@ -254,9 +304,10 @@ Options:
 
 The following NSFW features are not available in this port:
 
-* `validate`: extract (`-x`, `-X`), rename (`-r`), `--full` output,
+* `validate`: extract (`-x`, `-X`), `--full` output,
   `--related-titles`, `--regional-titles`, `--updates`, `--show-keys`
-* the `ticket`, `cnmt`, `query` and `cdn2nsp` commands
+* the `ticket`, `cnmt`, `hash` and `cdn2nsp` commands, and the hidden
+  `cmp`, `scan` and `ni` commands
 
 ## License
 

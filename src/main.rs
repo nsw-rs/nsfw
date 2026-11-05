@@ -7,6 +7,7 @@ mod build_titledb;
 mod diacritics;
 mod log;
 mod naming;
+mod query;
 mod titledb;
 mod validate;
 
@@ -31,9 +32,22 @@ enum Command {
     /// Validate NSP files, optionally converting them to Standard NSP.
     #[command(visible_alias = "v")]
     Validate(ValidateArgs),
+    /// Look up a title ID in TitleDB.
+    #[command(visible_alias = "q")]
+    Query(QueryArgs),
     /// Build titledb.db from the blawar/titledb JSON files.
     #[command(name = "build-titledb")]
     BuildTitleDb(BuildTitleDbArgs),
+}
+
+#[derive(clap::Args)]
+struct QueryArgs {
+    /// Path to titledb.db file.
+    #[arg(long = "titledb", default_value = "./titledb/titledb.db")]
+    titledb: String,
+    /// Title ID to search for.
+    #[arg(value_name = "TITLEID")]
+    title_id: String,
 }
 
 #[derive(clap::Args)]
@@ -55,12 +69,18 @@ struct ValidateArgs {
     #[arg(short = 'c', long = "cert", default_value = "~/.switch/common.cert")]
     cert: String,
     /// Convert to Standardised NSP.
-    #[arg(short = 's', long = "standard")]
+    #[arg(short = 's', long = "standard", conflicts_with = "rename")]
     standard: bool,
     /// Convert to Standardised NSZ: the Standard NSP with its program and
     /// public data NCAs compressed to NCZ (implies --standard).
-    #[arg(short = 'S', long = "nsz")]
+    #[arg(short = 'S', long = "nsz", conflicts_with = "rename")]
     nsz: bool,
+    /// Rename NSP to match TitleDB. No other actions performed.
+    #[arg(short = 'r', long = "rename")]
+    rename: bool,
+    /// When re-naming files, skip NCA hash validation.
+    #[arg(long = "skip-hash", conflicts_with_all = ["standard", "nsz"])]
+    skip_hash: bool,
     /// Path to standardised NSP output directory.
     #[arg(short = 'o', long = "nspdir", default_value = "./nsp")]
     nspdir: String,
@@ -287,6 +307,8 @@ fn validate(args: ValidateArgs) -> u8 {
         check_padding: args.check_padding,
         titledb: full_path(&expand_home(&args.titledb)),
         verify_title: args.verify,
+        rename: args.rename,
+        skip_hash: args.skip_hash,
     };
 
     log::set_progress(!args.quiet);
@@ -316,6 +338,25 @@ fn validate(args: ValidateArgs) -> u8 {
     code as u8
 }
 
+fn query(args: QueryArgs) -> u8 {
+    if args.title_id.chars().count() != 16 {
+        eprintln!("Error: Title ID must be 16 characters long.");
+        return 1;
+    }
+    let titledb = full_path(&expand_home(&args.titledb));
+    if !titledb.is_file() {
+        eprintln!("Error: TitleDB file {} does not exist.", titledb.display());
+        return 1;
+    }
+    match query::run(&titledb, &args.title_id) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            1
+        }
+    }
+}
+
 fn build_titledb(args: BuildTitleDbArgs) -> u8 {
     let dir = full_path(&expand_home(&args.titledbdir));
     if !dir.is_dir() {
@@ -342,6 +383,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Validate(args) => ExitCode::from(validate(args)),
+        Command::Query(args) => ExitCode::from(query(args)),
         Command::BuildTitleDb(args) => ExitCode::from(build_titledb(args)),
     }
 }
