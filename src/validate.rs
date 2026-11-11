@@ -25,7 +25,7 @@ use libhac::romfs::RomFs;
 use libhac::ticket::{LicenseType, SignatureType, Ticket, TitleKeyType};
 use libhac::{ReadAt, SubStorage, TitleId, npdm};
 use sha2::{Digest, Sha256};
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Seek, SeekFrom, Write};
@@ -114,6 +114,7 @@ struct RawEntry {
 struct ContentFile {
     file_name: String,
     hash: [u8; 32],
+    size: u64,
     content_type: cnmt::ContentEntryType,
     /// Present in the NSP only as `<nca id>.ncz`.
     compressed: bool,
@@ -332,6 +333,166 @@ fn hash_range(src: &dyn ReadAt, offset: u64, size: u64) -> Result<String> {
     Ok(hex::encode_upper(sha.finalize()))
 }
 
+/// SHA256 of the NCA that an NCZ decompresses to.
+fn hash_ncz(ncz: &NczReader<impl ReadAt>) -> Result<String> {
+    hash_range(ncz, 0, ncz.size()?)
+}
+
+/// How much of a solid NCZ is kept while it is checked: of its start one
+/// part in 256, within these bounds, and the last bytes passed. The hash
+/// levels of the first section are at its start, about one part in 512,
+/// and are read again for data far behind them. A hash table that lies
+/// just before its data is read after it.
+const SOLID_HEAD: (u64, u64) = (0x100_0000, 0x1000_0000);
+const SOLID_TAIL: usize = 0x100_0000;
+
+/// The NCA of an `.ncz` entry, for the checks that read its sections and
+/// for its hash.
+///
+/// A solid NCZ decodes from its start again for every read that goes
+/// back. So it is passed front to back once: the bytes up to what a check
+/// asks for are hashed on the way, and the start and the last bytes are
+/// kept. A read behind that, which the kept parts do not hold, still
+/// works, at the price of one more decoding. A block NCZ is read where the
+/// checks ask.
+struct Unpacked<'a, R> {
+    ncz: &'a NczReader<R>,
+    size: u64,
+    pass: RefCell<Pass>,
+}
+
+struct Pass {
+    /// Every byte before this offset was passed.
+    pos: u64,
+    /// The bytes from offset 0 that are kept, `head_max` at most.
+    head: Vec<u8>,
+    head_max: u64,
+    /// The bytes up to `pos` that are kept: `SOLID_TAIL` to twice that.
+    tail: Vec<u8>,
+    /// `None` when the hash is not wanted.
+    sha: Option<Sha256>,
+    pb: ProgressBar,
+}
+
+impl Pass {
+    /// Pass the bytes up to offset `to`.
+    fn advance(&mut self, src: &impl ReadAt, to: u64) -> libhac::Result<()> {
+        let mut buf = vec![0u8; to.saturating_sub(self.pos).min(0x100000) as usize];
+        while self.pos < to {
+            let n = (to - self.pos).min(buf.len() as u64) as usize;
+            src.read_at(self.pos, &mut buf[..n])?;
+            self.take(&buf[..n]);
+        }
+        Ok(())
+    }
+
+    /// Account for the bytes at `pos`, which were just read.
+    fn take(&mut self, bytes: &[u8]) {
+        let room = self.head_max.saturating_sub(self.pos);
+        let keep = (bytes.len() as u64).min(room) as usize;
+        self.head.extend_from_slice(&bytes[..keep]);
+        if self.head_max > 0 {
+            self.tail.extend_from_slice(bytes);
+            if self.tail.len() > 2 * SOLID_TAIL {
+                self.tail.drain(..self.tail.len() - SOLID_TAIL);
+            }
+        }
+        if let Some(sha) = &mut self.sha {
+            sha.update(bytes);
+        }
+        self.pb.inc(bytes.len() as u64);
+        self.pos += bytes.len() as u64;
+    }
+}
+
+impl Drop for Pass {
+    fn drop(&mut self) {
+        self.pb.finish_and_clear();
+    }
+}
+
+impl<'a, R: ReadAt> Unpacked<'a, R> {
+    fn new(ncz: &'a NczReader<R>, hash: bool) -> Result<Self> {
+        let size = ncz.size()?;
+        let label = if hash { "Hashing" } else { "Checking" };
+        Ok(Unpacked {
+            ncz,
+            size,
+            pass: RefCell::new(Pass {
+                pos: 0,
+                head: Vec::new(),
+                head_max: if ncz.is_solid() {
+                    (size / 256).clamp(SOLID_HEAD.0, SOLID_HEAD.1)
+                } else {
+                    0
+                },
+                tail: Vec::new(),
+                sha: hash.then(Sha256::new),
+                // Reads of a block NCZ skip the pass, so without the hash
+                // nothing moves this bar.
+                pb: if hash || ncz.is_solid() {
+                    progress_bar(label, size)
+                } else {
+                    ProgressBar::hidden()
+                },
+            }),
+        })
+    }
+
+    /// Upper-case hex SHA256 of the whole NCA.
+    fn hash(&self) -> Result<String> {
+        let mut pass = self.pass.borrow_mut();
+        pass.advance(self.ncz, self.size)?;
+        let sha = pass.sha.take().ok_or_else(|| anyhow!("no hash taken"))?;
+        Ok(hex::encode_upper(sha.finalize()))
+    }
+}
+
+impl<R: ReadAt> ReadAt for Unpacked<'_, R> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> libhac::Result<()> {
+        let in_range = offset
+            .checked_add(buf.len() as u64)
+            .is_some_and(|end| end <= self.size);
+        // A read out of range gets its error from the NCZ.
+        if !self.ncz.is_solid() || !in_range {
+            return self.ncz.read_at(offset, buf);
+        }
+        let mut pass = self.pass.borrow_mut();
+        let mut done = 0;
+        while done < buf.len() {
+            let at = offset + done as u64;
+            let rest = &mut buf[done..];
+            let kept = pass.head.len() as u64;
+            done += if at < kept {
+                let n = (kept - at).min(rest.len() as u64) as usize;
+                rest[..n].copy_from_slice(&pass.head[at as usize..][..n]);
+                n
+            } else if at < pass.pos {
+                let n = (pass.pos - at).min(rest.len() as u64) as usize;
+                let from = usize::try_from(pass.pos - at)
+                    .ok()
+                    .and_then(|back| pass.tail.len().checked_sub(back));
+                match from {
+                    Some(from) => rest[..n].copy_from_slice(&pass.tail[from..][..n]),
+                    // Passed and not kept.
+                    None => self.ncz.read_at(at, &mut rest[..n])?,
+                }
+                n
+            } else {
+                pass.advance(self.ncz, at)?;
+                self.ncz.read_at(at, rest)?;
+                pass.take(rest);
+                rest.len()
+            };
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> libhac::Result<u64> {
+        Ok(self.size)
+    }
+}
+
 /// What the Standard NSP does with one CNMT content entry.
 enum Planned {
     /// Index into the NSP's NCAs.
@@ -432,8 +593,12 @@ struct PartialNsp {
     /// writes the header again.
     files: Vec<(String, u64)>,
     tail_sizes: Vec<u64>,
-    /// Upper-case hex SHA256 of each written NCA, by file name.
+    /// Upper-case hex SHA256 of each written NCA, by the name of its entry
+    /// in the source. For an `.ncz` entry it is that of the decompressed NCA.
     hashes: HashMap<String, String>,
+    /// Offset and size, in the partial file, of each NCA that was written
+    /// decompressed from an `.ncz` entry, by the name of that entry.
+    copies: HashMap<String, (u64, u64)>,
 }
 
 impl PartialNsp {
@@ -450,22 +615,24 @@ impl PartialNsp {
         // Never an existing file, also with `--overwrite`, and never
         // through a link: it can be what another run for the same title is
         // writing, and that run would give its name to this file.
-        let (part, file) =
-            PartFile::open(tmp.clone(), OpenOptions::new().write(true).create_new(true)).map_err(
-                |e| match e.kind() {
-                    ErrorKind::AlreadyExists => anyhow!(
-                        "{} exists: another run is writing it, or a run was killed. Delete it if no run is active.",
-                        tmp.display()
-                    ),
-                    _ => e.into(),
-                },
-            )?;
+        let (part, file) = PartFile::open(
+            tmp.clone(),
+            OpenOptions::new().read(true).write(true).create_new(true),
+        )
+        .map_err(|e| match e.kind() {
+            ErrorKind::AlreadyExists => anyhow!(
+                "{} exists: another run is writing it, or a run was killed. Delete it if no run is active.",
+                tmp.display()
+            ),
+            _ => e.into(),
+        })?;
         let mut p = PartialNsp {
             out: Some(BufWriter::with_capacity(0x100000, file)),
             part,
             files: Vec::new(),
             tail_sizes: tail.iter().map(|t| t.1.len() as u64).collect(),
             hashes: HashMap::new(),
+            copies: HashMap::new(),
         };
         // Each writer is planned once: planning reads the AesCtrEx tables,
         // which for a solid NCZ input means decoding up to them.
@@ -492,6 +659,7 @@ impl PartialNsp {
         let header = p.header(tail);
         let out = p.out.as_mut().expect("started");
         out.write_all(&header)?;
+        let mut at = header.len() as u64;
         let label = if nsz.is_some() {
             "Compressing"
         } else {
@@ -519,21 +687,35 @@ impl PartialNsp {
                     size
                 }
             };
+            let hash = sha.finalize();
             if ncas[i].ncz.is_some() {
-                let current = hex::encode_upper(&sha.finalize()[..16]);
+                let current = hex::encode_upper(&hash[..16]);
                 let target = ncas[i].ncz_target_hash().to_uppercase();
                 if current != target {
                     bail!(
                         "Current hash ({current}) does not match original hash ({target}). File is corrupted."
                     );
                 }
-                continue;
             }
             p.hashes
-                .insert(ncas[i].file_name.clone(), hex::encode_upper(sha.finalize()));
+                .insert(ncas[i].file_name.clone(), hex::encode_upper(hash));
+            if ncas[i].ncz.is_some() && writers[k].is_none() {
+                p.copies
+                    .insert(ncas[i].file_name.clone(), (at, p.files[k].1));
+            }
+            at += p.files[k].1;
         }
+        // The copies are read back through the same file.
+        out.flush()?;
         pb.finish_and_clear();
         Ok(p)
+    }
+
+    /// The NCA that was written for the `.ncz` entry `name`, read back from
+    /// the output. `None` when the output holds it compressed.
+    fn copy_of(&self, name: &str) -> Option<SubStorage<&File>> {
+        let &(offset, size) = self.copies.get(name)?;
+        SubStorage::new(self.out.as_ref()?.get_ref(), offset, size).ok()
     }
 
     fn finish(mut self, target: &Path, tail: &[(String, Vec<u8>)]) -> Result<()> {
@@ -545,6 +727,8 @@ impl PartialNsp {
             bail!("ticket or certificate size changed after the header was written");
         }
         let mut out = self.out.take().expect("started");
+        // On Windows, reading a copy back moved the file position.
+        out.seek(SeekFrom::End(0))?;
         for (_, bytes) in tail {
             out.write_all(bytes)?;
         }
@@ -864,8 +1048,19 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                 if is_meta {
                     let cnmt = read_pfs_file(&nca, nca.data_section_index(), &title_keys, |n| {
                         n.ends_with(".cnmt")
-                    })?
-                    .ok_or_else(|| anyhow!("Sequence contains no elements"))?;
+                    });
+                    // Keys older than the title: say so, the file is not corrupt.
+                    if let Err(e) = &cnmt
+                        && matches!(e.downcast_ref(), Some(libhac::Error::MissingKey(_)))
+                    {
+                        let key_gen = nca.key_generation();
+                        let rev = key_gen.master_key_revision();
+                        ftl!(
+                            "{phase} <- The keys file lacks the keys of key generation {key_gen} (key_area_key_*_{rev:02x}, titlekek_{rev:02x})."
+                        );
+                        return Ok(Some(1));
+                    }
+                    let cnmt = cnmt?.ok_or_else(|| anyhow!("Sequence contains no elements"))?;
                     let parsed = Cnmt::parse(&cnmt)?;
                     if parsed.attributes.contains(ContentAttributes::COMPACTED) {
                         has_sparse_ncas = true;
@@ -1039,6 +1234,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         content_files.push(ContentFile {
             file_name,
             hash: ce.hash,
+            size: ce.size,
             content_type: ce.content_type,
             compressed,
         });
@@ -1077,10 +1273,6 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         main.rights_id().to_string()
     };
     let key_gen = main.key_generation();
-    if key_gen.0 > 18 {
-        ftl!("Unsupported key generation ({key_gen}). Contact author to update!");
-        return Ok(1);
-    }
     let has_title_key_crypto = !main.rights_id().is_zero();
     if main.distribution_type() != DistributionType::DOWNLOAD {
         ftl!("{phase} - Unsupported distribution type : GameCard");
@@ -1414,6 +1606,10 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     // now so each NCA is read once, for both its hash and the copy.
     // Failed checks later drop the partial file.
     let too_long = path_too_long(&target_name, 254);
+    let signed: Vec<bool> = ncas
+        .iter()
+        .map(|n| n.nca.verify_header_signature())
+        .collect();
     let would_convert = settings.convert
         && !settings.dry_run
         && can_proceed
@@ -1432,7 +1628,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         && !(target_name == nsp_path || is_same_file(&target_name, nsp_path))
         // The sizes of what gets written were checked against the CNMT,
         // which counts only when it comes from a signed meta NCA.
-        && ncas.iter().all(|n| n.nca.verify_header_signature());
+        && signed.iter().all(|&s| s);
     let mut pending = None;
     if would_convert {
         let order = output_order(&plan, meta_idx);
@@ -1454,20 +1650,79 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     }
 
     let has_compressed_nca = ncas.iter().any(|n| n.ncz.is_some());
+    let meta_signed = signed[meta_idx];
     let mut nca_files: Vec<NcaInfo> = Vec::new();
-    for fs_nca in &ncas {
+    for (fs_nca, &header_valid) in ncas.iter().zip(&signed) {
         let nca = &fs_nca.nca;
-        let npdm_validity = if !has_sparse_ncas {
-            verify_npdm(nca, &title_keys)
-        } else {
-            None
+        let name = &fs_nca.file_name;
+        // The CNMT lists an NCZ under the name of its NCA, in lower case:
+        // the NCZ was matched to its CNMT entry in any case above.
+        let listed = match fs_nca.ncz {
+            Some(_) => format!("{}.nca", fs_nca.ncz_target_hash().to_lowercase()),
+            None => name.clone(),
         };
+        let listed = content_files.iter().find(|c| c.file_name == listed);
+        // The sections of an NCZ open only on the NCA it decompresses to.
+        // Decompressing takes time by the size the NCZ states, so it is
+        // done only when that is the size in a CNMT from a signed meta NCA:
+        // every other case is reported as an error of its own. Nor is it
+        // done with `--skip-hash`, which is there to save that time.
+        let size_listed = |z: &NczReader<_>| listed.is_some_and(|c| z.size().ok() == Some(c.size));
+        let written = pending.as_ref().and_then(|p| p.hashes.get(name));
+        let unpack = fs_nca
+            .ncz
+            .as_ref()
+            .filter(|z| !settings.skip_hash && meta_signed && size_listed(z));
+        // A conversion to NSP has decompressed it already: its copy in the
+        // output is read, not the NCZ a second time.
+        let copy = unpack.and(pending.as_ref()).and_then(|p| p.copy_of(name));
+        let unpacked = match (unpack, &copy) {
+            (Some(z), None) => Some(Unpacked::new(z, written.is_none())?),
+            _ => None,
+        };
+        let plain = match (&copy, &unpacked) {
+            (Some(c), _) => Some(Nca::open(keys, Box::new(c) as Box<dyn ReadAt + '_>)?),
+            (None, Some(u)) => Some(Nca::open(keys, Box::new(u) as Box<dyn ReadAt + '_>)?),
+            (None, None) => None,
+        };
+        let readable = fs_nca.ncz.is_none() || plain.is_some();
         let mut info = NcaInfo {
-            header_valid: nca.verify_header_signature(),
+            header_valid,
             sections_errored: false,
             hash_match: HashMatch::Missing,
         };
-        let name = &fs_nca.file_name;
+        // The sections are checked from the last to the first, and the NPDM
+        // (in section 0) after them: that is their order in an NCA, where
+        // the ExeFS comes last, and a solid NCZ is passed front to back.
+        let mut failed = Vec::new();
+        let sections: Vec<_> = SectionIndex::all().collect();
+        for &i in sections.iter().rev() {
+            if !nca.can_open_section(i, &title_keys) {
+                continue;
+            }
+            if nca.fs_header(i).is_patch_section() {
+                continue;
+            }
+            if !readable {
+                // The sections of an NCZ that stays compressed cannot
+                // open. With `--skip-hash` that is what was asked for.
+                info.sections_errored = !settings.skip_hash && !has_sparse_ncas;
+                continue;
+            }
+            let opened = match &plain {
+                Some(plain) => check_section_fs(plain, i, &title_keys),
+                None => check_section_fs(nca, i, &title_keys),
+            };
+            if opened.is_err() && !has_sparse_ncas {
+                info.sections_errored = true;
+                failed.push(i);
+            }
+        }
+        let npdm_validity = match &plain {
+            _ if has_sparse_ncas => None,
+            Some(plain) => verify_npdm(plain, &title_keys),
+            None => verify_npdm(nca, &title_keys),
+        };
 
         if !info.header_valid {
             errors.add(format!("{phase} - {name} <- Header signature is invalid."));
@@ -1480,35 +1735,21 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                 errors.add(format!("{phase} - {name} <- NPDM signature is invalid."));
                 can_proceed = false;
             }
-            None if ct == ContentType::PROGRAM && !has_sparse_ncas && !has_compressed_nca => {
+            None if ct == ContentType::PROGRAM && !has_sparse_ncas && readable => {
                 errors.add(format!("{phase} - {name} <- Error opening NPDM."));
             }
             _ => {}
         }
-
-        for i in SectionIndex::all() {
-            if !nca.can_open_section(i, &title_keys) {
-                continue;
-            }
-            if nca.fs_header(i).is_patch_section() {
-                continue;
-            }
-            if check_section_fs(nca, i, &title_keys).is_err() && !has_sparse_ncas {
-                info.sections_errored = true;
-                // The sections of an NCZ are compressed, so they never open.
-                if fs_nca.ncz.is_some() {
-                    continue;
-                }
-                let type_name = if ct == ContentType::DATA {
-                    "Delta"
-                } else {
-                    ct.name().unwrap_or("Unknown")
-                };
-                errors.add(format!(
-                    "{phase} - {name} ({type_name}) (Section {i}) <- Error opening file-system"
-                ));
-                can_proceed = false;
-            }
+        for i in failed.into_iter().rev() {
+            let type_name = if ct == ContentType::DATA {
+                "Delta"
+            } else {
+                ct.name().unwrap_or("Unknown")
+            };
+            errors.add(format!(
+                "{phase} - {name} ({type_name}) (Section {i}) <- Error opening file-system"
+            ));
+            can_proceed = false;
         }
 
         if settings.skip_hash {
@@ -1518,7 +1759,14 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         }
 
         let headers_valid = nca_files.iter().all(|n| n.header_valid);
-        if settings.force_hash || (!info.is_errored() && headers_valid) {
+        // The sections of an NCZ that stays compressed do not tell whether
+        // its hash is worth a check.
+        let hashable = if readable {
+            !info.is_errored()
+        } else {
+            info.header_valid && meta_signed
+        };
+        if settings.force_hash || (hashable && headers_valid) {
             if settings.force_hash {
                 wrn!("{phase} - Forcing hash check.");
             }
@@ -1529,12 +1777,36 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             if raw.size == 0 {
                 continue;
             }
-            let nca_hash = match pending.as_ref().and_then(|p| p.hashes.get(name)) {
-                Some(h) => h.clone(),
-                None => hash_range(&whole, raw.offset, raw.size)?,
+            // A compressed meta NCA has no entry in the CNMT, like any other
+            // unlisted file.
+            let is_meta = ct == ContentType::META && fs_nca.ncz.is_none();
+            if !is_meta && listed.is_none() {
+                bail!("The given key '{name}' was not present in the dictionary.");
+            }
+            let nca_hash = match (written, &fs_nca.ncz) {
+                (Some(h), _) => h.clone(),
+                (None, None) => hash_range(&whole, raw.offset, raw.size)?,
+                // A size that is not the one in the CNMT was reported with
+                // the CNMT, and no hash can match it.
+                (None, Some(z)) if !size_listed(z) => {
+                    nca_files.push(info);
+                    continue;
+                }
+                // What counts is the NCA that the NCZ decompresses to.
+                (None, Some(z)) => {
+                    match unpacked.as_ref().map_or_else(|| hash_ncz(z), |u| u.hash()) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            errors.add(format!("{phase} - {name} <- Error decompressing NCZ: {e}"));
+                            can_proceed = false;
+                            nca_files.push(info);
+                            continue;
+                        }
+                    }
+                }
             };
             let expected: String;
-            if ct == ContentType::META {
+            if is_meta {
                 // Cut by characters: a byte cut can split a non-ASCII name and panic.
                 expected = name
                     .chars()
@@ -1549,9 +1821,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                     HashMatch::Mismatch
                 };
             } else {
-                let Some(cf) = content_files.iter().find(|c| &c.file_name == name) else {
-                    bail!("The given key '{name}' was not present in the dictionary.");
-                };
+                let cf = listed.expect("checked above");
                 expected = hex::encode_upper(cf.hash);
                 info.hash_match = if nca_hash.eq_ignore_ascii_case(&expected) {
                     HashMatch::Match

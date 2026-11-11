@@ -129,10 +129,12 @@ NSZ files (NSPs with compressed `.ncz` NCAs, block or solid) are accepted
 too, also in directory scans. They are reported with a "Compressed NCA"
 warning. See below for converting them to Standard NSP.
 
-> [!WARNING]
-> Like NSFW, a plain `validate` and `-r` do not decompress the `.ncz`
-> files, so damage inside one is not found and the exit code is 0. Only a
-> conversion (`-s`, `-S`) decompresses every NCA and checks its hash.
+Every `validate` of an NSZ, also a plain one and `-r`, decompresses each
+`.ncz` and checks it as the NCA it stands for: its sections, its NPDM
+signature and its hash against the CNMT. So an NSZ gets the verdict of its
+NSP, and a damaged `.ncz` fails validation (exit code 1). The whole file is
+read and decompressed for that. `--skip-hash` leaves an `.ncz` compressed:
+neither its hash nor its sections are checked.
 
 `-H` checks the header and the string table padding of the NSP itself, not
 of the NCAs inside, and nothing else: with it `-s`, `-S` and `-r` do nothing.
@@ -357,8 +359,21 @@ this port does differently:
 * Additions: several paths for `validate`, Standard NSZ output (`-S`), NSZ
   input with solid NCZ, a common certificate taken from the NSP when the
   file is missing, progress bars.
-* A compressed NCA whose size is not the one in the CNMT fails validation.
-  NSFW finds it only when it converts the file.
+* The `.ncz` files of an NSZ are decompressed and checked in every
+  `validate`, also with `-r`: one that is damaged, or whose size is not the
+  one in the CNMT, fails validation. NSFW checks them only when it converts
+  the file, and reports the damage there as a failed conversion.
+  `--force-hash` works on an NSZ.
+* The sections and the NPDM of an `.ncz` are checked on the decompressed
+  NCA. An intact NSZ reads "No problems found", and one whose ticket does
+  not open the sections is not converted. NSFW cannot open the sections of
+  an `.ncz`: it reports "Problems found" for every NSZ and converts it
+  without that check.
+* There is no upper limit on the key generation. NSFW refuses a title
+  above key generation 18, which is every title made for firmware 19.0.0
+  or later. What counts is that the keys file has the keys
+  (`key_area_key_*_XX`, `titlekek_XX`) of that generation: when it does
+  not, the message says so. NSFW derives them from the master keys.
 * A conversion goes to a `.part` file that is renamed at the end. NSFW
   writes the final name directly and deletes it when the conversion fails.
 * The output path length limit (254 characters) applies on Windows only.
@@ -379,7 +394,8 @@ this port does differently:
   region rows again.
 * `query` prints plain rows instead of nested tables, and takes only a
   hexadecimal title ID.
-* The properties table has no "Meta Validity" row.
+* The properties table shows the key generation as a number (NSFW shows a
+  firmware range) and has no "Meta Validity" row.
 
 ## Not ported (yet)
 
