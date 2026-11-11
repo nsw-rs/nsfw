@@ -45,6 +45,9 @@ pub fn is_common_cert(data: &[u8]) -> bool {
 const MAX_TICKET_SIZE: u64 = 0x10000;
 const MAX_META_FILE_SIZE: u64 = 0x100_0000;
 
+/// Why `--delete-source` leaves the source of some updates in place.
+const STALE_SIGNATURE: &str = "the new ticket of this update keeps a signature that does not sign it, so the output fails validation";
+
 /// Size of the `XS00000020` ticket signer certificate, the first one in the
 /// common chain. Some update NSPs carry the chain with the two certificates
 /// swapped (`XS00000020` then `CA00000003`).
@@ -232,6 +235,12 @@ fn is_order_correct(entries: &[RawEntry]) -> bool {
         .iter()
         .filter_map(|e| assign_priority(&e.name))
         .is_sorted()
+}
+
+/// A file name as a title: NSFW removes every ".nsp" from it. ".nsz" goes
+/// the same way, which NSFW leaves in.
+fn without_extension(file_name: &str) -> String {
+    file_name.replace(".nsp", "").replace(".nsz", "")
 }
 
 /// True when both paths name the same existing file, including relative
@@ -1112,6 +1121,39 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         bad_padding = true;
         errors.add(format!("{phase} <- NSP header needs additional padding."));
     }
+    // Stricter than NSFW: a Standard NSP is the header of its files, then
+    // the files back to back in the order of the file table, and nothing
+    // after them. The checks above miss gaps, data in another order, stray
+    // bytes in the header and bytes after the last file. A file that they
+    // report keeps its messages.
+    if !bad_padding {
+        let mut layout = Pfs0Builder::new();
+        let mut data = Some(0u64);
+        for e in &raw_entries {
+            layout.add_file(e.name.as_str(), e.size);
+            data = data.and_then(|d| d.checked_add(e.size));
+        }
+        let layout = data.map(|d| (layout.to_bytes(), d));
+        match layout {
+            Some((header, data)) if whole.read_vec(0, header.len()).is_ok_and(|h| h == header) => {
+                // The offsets are the ones of the builder, and each file
+                // lies inside the NSP, so this is not past its end.
+                let extra = file_size.saturating_sub(header.len() as u64 + data);
+                if extra != 0 {
+                    bad_padding = true;
+                    errors.add(format!(
+                        "{phase} <- NSP has {extra} bytes after the last file."
+                    ));
+                }
+            }
+            _ => {
+                bad_padding = true;
+                errors.add(format!(
+                    "{phase} <- NSP file-header is non-standard (gaps, data order or stray bytes)."
+                ));
+            }
+        }
+    }
 
     if settings.check_padding {
         vrb!("String Table Size           : {table_size}");
@@ -1415,7 +1457,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     let (mut display_title, mut source) = match control_title {
         Some(t) => (t, LookupSource::Control),
         None => (
-            file_name.replace('_', " ").replace(".nsp", ""),
+            without_extension(&file_name.replace('_', " ")),
             LookupSource::FileName,
         ),
     };
@@ -1427,7 +1469,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             display_title = file_name.split('[').next().unwrap().trim().to_string();
             source = LookupSource::FileTitle;
         } else {
-            display_title = file_name.replace(".nsp", "");
+            display_title = without_extension(&file_name);
             source = LookupSource::FileName;
         }
     }
@@ -2027,6 +2069,10 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         return Ok(0);
     }
 
+    // The new ticket of an update keeps the signature of the old one, as in
+    // NSFW. It signs the old fields, so the output fails its own validation
+    // ("Ticket signature is invalid."), and the source must not be deleted.
+    let mut stale_signature = false;
     if let Some(t) = &ticket
         && has_title_key_crypto
         && (!is_ticket_signature_valid || generate_new_ticket)
@@ -2040,6 +2086,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         } else {
             let enc = title_key_encrypted.ok_or_else(|| anyhow!("Missing encrypted title key"))?;
             ticket = Some(Ticket::create(master_key_rev, t.rights_id, &enc, signature));
+            stale_signature = is_update;
             inf!("Generated new normalised ticket.");
         }
     }
@@ -2130,7 +2177,13 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         return Ok(2);
     }
     if settings.dry_run {
-        if settings.delete_source {
+        if settings.delete_source && stale_signature {
+            wrn!(
+                "{} -> Would not delete {}: {STALE_SIGNATURE}.",
+                tag("DRYRUN"),
+                olive(&file_name)
+            );
+        } else if settings.delete_source {
             inf!("{} -> Would delete: {}", tag("DRYRUN"), olive(&file_name));
         }
         return Ok(0);
@@ -2157,6 +2210,10 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
     inf!("Converted: {}", olive(&output_file));
 
     if settings.delete_source {
+        if stale_signature {
+            crate::err!("Source not deleted: {STALE_SIGNATURE}.");
+            return Ok(1);
+        }
         drop(file);
         if let Err(e) = std::fs::remove_file(nsp_path) {
             crate::err!("Failed to delete file. {e}");

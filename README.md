@@ -247,7 +247,9 @@ the decompressed NSP.
 
 The output is written as `<name>.part` in the output directory, synced to
 disk and then renamed, so the final name only ever holds a complete file.
-The source is deleted (`-Z`) only after that. Ctrl-C and a closed output
+The source is deleted (`-Z`) only after that, and not at all when the output
+is an update that fails validation (see
+[Differences from NSFW](#differences-from-nsfw)). Ctrl-C and a closed output
 (`nsfw v -s dir | head`) stop the run and remove the partial file. A run
 that was killed leaves it behind, and a later run then refuses to convert
 that title until the `.part` file is deleted: it cannot know that no other
@@ -374,6 +376,20 @@ this port does differently:
   or later. What counts is that the keys file has the keys
   (`key_area_key_*_XX`, `titlekek_XX`) of that generation: when it does
   not, the message says so. NSFW derives them from the master keys.
+* "Is Standard NSP?" is stricter: the file must be the header of its
+  files, then the files back to back in the order of the file table, and
+  nothing after them. A gap, data in another order, a stray byte in the
+  header padding or bytes after the last file give "Problems found", "File
+  Padding: Incorrect" and a conversion with `-s`. NSFW reads three bytes
+  near the end of the file and says "Yes" for all of these. `-H` fails on
+  them too.
+* A title taken from the file name loses `.nsz` as it loses `.nsp`. NSFW
+  leaves `.nsz` in: `game.nsz` gives `game.nsz (Unknown)[...]`.
+* `-Z` does not delete the source of an update whose ticket had to be
+  written again (exit code 1). As in NSFW, the new ticket of an update
+  keeps the signature of the old one, which does not sign the new fields,
+  so the output fails validation ("Ticket signature is invalid."). The
+  output bytes are the ones of NSFW.
 * A conversion goes to a `.part` file that is renamed at the end. NSFW
   writes the final name directly and deletes it when the conversion fails.
 * The output path length limit (254 characters) applies on Windows only.
