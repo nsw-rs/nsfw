@@ -10,6 +10,7 @@
 //! same order before the stable sorts.
 
 use anyhow::{Result, bail};
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, params};
 use std::path::Path;
 
@@ -38,9 +39,52 @@ fn index_of(order: &[&str], s: Option<&str>) -> i32 {
         .map_or(-1, |p| p as i32)
 }
 
+/// SQLite URI that opens `path` as a file nobody changes.
+fn immutable_uri(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    let mut uri = String::from("file:");
+    // A drive path needs a root in front, and `/` between its parts.
+    if cfg!(windows) {
+        uri.push('/');
+    }
+    for &b in path.as_bytes() {
+        match b {
+            b'\\' if cfg!(windows) => uri.push('/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b':' => {
+                uri.push(b as char)
+            }
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri + "?immutable=1"
+}
+
 impl TitleDb {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // The DB is in WAL mode, and a plain read-only open of one writes
+        // `-shm` and `-wal` files next to it and fails on a read-only
+        // medium. An immutable open reads the file as it is, so it must
+        // not be used while a WAL holds changes. It is also what a path
+        // that makes no valid URI (a network share on Windows) falls back
+        // from.
+        let wal = crate::with_suffix(path, "-wal");
+        let wal_in_use = std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0);
+        let immutable = if wal_in_use {
+            None
+        } else {
+            Connection::open_with_flags(
+                immutable_uri(path),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+            .ok()
+        };
+        let conn = match immutable {
+            Some(c) => c,
+            None => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
+        };
+        // The file comes from somewhere else: what its schema says (views,
+        // triggers, functions in them) gets no trust.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
         Ok(Self { conn })
     }
 
@@ -259,7 +303,55 @@ fn distribution_region(list: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::distribution_region;
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_uri_escapes() {
+        assert_eq!(
+            immutable_uri(Path::new("/a b/t?x#y%z/titledb.db")),
+            "file:/a%20b/t%3Fx%23y%25z/titledb.db?immutable=1"
+        );
+        assert_eq!(
+            immutable_uri(Path::new("/d/\u{e9}.db")),
+            "file:/d/%C3%A9.db?immutable=1"
+        );
+    }
+
+    /// A read must leave nothing next to a WAL mode DB, and must work when
+    /// the directory cannot be written.
+    #[cfg(unix)]
+    #[test]
+    fn open_leaves_no_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/titledb open #1");
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("titledb.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            r#"create table "GameInfo" ("Id" varchar, "Ids" varchar, "Name" varchar,
+               "ReleaseDate" integer, "RegionLanguage" varchar, "Publisher" varchar,
+               "Description" varchar, "NsuId" integer);
+               insert into "GameInfo" ("Id", "Name") values ('0100000000001000', 'A (B)');"#,
+        )
+        .unwrap();
+        drop(conn);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let db = TitleDb::open(&path).unwrap();
+        let title = db.look_up_title("0100000000001000").unwrap();
+        drop(db);
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(title.as_deref(), Some("A - B"));
+        assert_eq!(files, ["titledb.db"]);
+    }
 
     #[test]
     fn region_buckets() {

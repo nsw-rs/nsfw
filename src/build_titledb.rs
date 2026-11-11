@@ -8,12 +8,12 @@
 //! original tool. `CnmtData` has no `Id` column: the released binary does
 //! not create it, although the class declares one.
 
-use crate::log::{olive, tag};
+use crate::log::{line, olive, part, tag};
+use crate::with_suffix;
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use rusqlite::{Connection, params};
 use serde::Deserialize;
-use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
@@ -160,21 +160,65 @@ fn region_files(dir: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn remove_if_there(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 pub fn run(dir: &Path, clean: bool) -> Result<()> {
     let db_path = dir.join("titledb.db");
-    if db_path.exists() && clean {
-        println!("{} Clean old DB.", tag("DONE"));
-        std::fs::remove_file(&db_path)?;
+    if clean {
+        clean_build(dir, &db_path)?;
+    } else {
+        build(dir, &db_path)?;
     }
+    line(&tag("COMPLETE!"));
+    Ok(())
+}
 
-    let mut conn = Connection::open(&db_path)?;
+/// A clean build goes to a file of its own, which takes the place of the
+/// old DB once it is complete: a JSON file that fails to parse leaves the
+/// old DB as it was.
+fn clean_build(dir: &Path, db_path: &Path) -> Result<()> {
+    if db_path.exists() {
+        line(&format!("{} Clean old DB.", tag("DONE")));
+    }
+    let new_path = with_suffix(db_path, ".new");
+    let remove_new = || {
+        ["", "-wal", "-shm"]
+            .iter()
+            .try_for_each(|suffix| remove_if_there(&with_suffix(&new_path, suffix)))
+    };
+    // What a killed run left behind.
+    remove_new()?;
+    if let Err(e) = build(dir, &new_path) {
+        let _ = remove_new();
+        return Err(e);
+    }
+    // The WAL of the old DB must not meet the new one.
+    for suffix in ["-wal", "-shm"] {
+        remove_if_there(&with_suffix(db_path, suffix))?;
+    }
+    std::fs::rename(&new_path, db_path)?;
+    Ok(())
+}
+
+/// Add the rows of the JSON files in `dir` to the DB at `db_path`.
+fn build(dir: &Path, db_path: &Path) -> Result<()> {
+    let mut conn = Connection::open(db_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(SCHEMA)?;
     // One transaction instead of one per row: same rows, much faster.
     let tx = conn.transaction()?;
+    // Without `-c` the rows of an earlier run stay. `GameInfo` skips the
+    // ones it has; these tables would get every row a second time.
+    tx.execute_batch(
+        r#"delete from "CnmtData"; delete from "TitleVersions"; delete from "TitleRegion";"#,
+    )?;
 
-    print!("Ingesting: {}...", olive("CNMT"));
-    std::io::stdout().flush()?;
+    part(&format!("Ingesting: {}...", olive("CNMT")));
     let cnmts: IndexMap<String, IndexMap<String, CnmtJson>> = read_json(&dir.join("cnmts.json"))?;
     {
         let mut stmt = tx.prepare(
@@ -189,10 +233,9 @@ pub fn run(dir: &Path, clean: bool) -> Result<()> {
         }
     }
     drop(cnmts);
-    println!("{}", tag("DONE"));
+    line(&tag("DONE"));
 
-    print!("Ingesting: {}...", olive("VERSIONS"));
-    std::io::stdout().flush()?;
+    part(&format!("Ingesting: {}...", olive("VERSIONS")));
     let versions: IndexMap<String, IndexMap<String, Option<String>>> =
         read_json(&dir.join("versions.json"))?;
     {
@@ -206,7 +249,7 @@ pub fn run(dir: &Path, clean: bool) -> Result<()> {
         }
     }
     drop(versions);
-    println!("{}", tag("DONE"));
+    line(&tag("DONE"));
 
     let mut entries: Vec<String> = [
         "US.en", "GB.en", "JP.ja", "DE.de", "FR.fr", "ES.es", "IT.it", "NL.nl", "PT.pt", "KR.ko",
@@ -230,8 +273,7 @@ pub fn run(dir: &Path, clean: bool) -> Result<()> {
         r#"insert into "GameInfo"("NsuId","BannerUrl","Category","Description","Developer","FrontBoxArt","IconUrl","Id","Ids","Intro","IsDemo","Key","Languages","Name","NumberOfPlayers","Publisher","Rating","RatingContent","Region","ReleaseDate","RightsId","Screenshots","Size","Version","RegionLanguage") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
     )?;
     for entry in &entries {
-        print!("Ingesting: {}...", olive(entry));
-        std::io::stdout().flush()?;
+        part(&format!("Ingesting: {}...", olive(entry)));
         let timer = Instant::now();
         let path = Path::new(entry);
         let games: IndexMap<String, GameJson> = read_json(path)?;
@@ -279,14 +321,15 @@ pub fn run(dir: &Path, clean: bool) -> Result<()> {
             ])?;
             count += 1;
         }
-        println!(
+        line(&format!(
             "{} - Added {count} - ({:.2}s)",
             tag("DONE"),
             timer.elapsed().as_secs_f64()
-        );
+        ));
     }
     drop((region_stmt, exists_stmt, game_stmt));
     tx.commit()?;
-    println!("{}", tag("COMPLETE!"));
+    // Closing folds the WAL into the file.
+    conn.close().map_err(|(_, e)| e)?;
     Ok(())
 }

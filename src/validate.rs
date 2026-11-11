@@ -9,13 +9,14 @@
 
 use crate::log::{blue, green, grey, olive, paren, red, tag};
 use crate::naming::{self, Lang, LanguageMode, NameInputs};
+use crate::stop::PartFile;
 use crate::titledb::TitleDb;
 use crate::{ftl, inf, vrb, wrn};
 use anyhow::{Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use libhac::cnmt::{self, Cnmt, ContentAttributes, MetaType};
 use libhac::keys::Keys;
-use libhac::nacp::Nacp;
+use libhac::nacp::{NACP_SIZE, Nacp};
 use libhac::nca::{ContentType, DistributionType, FsType, Nca, SectionIndex, TitleKeys};
 use libhac::ncz::{NczReader, NczWriter};
 use libhac::partition::PartitionFs;
@@ -26,8 +27,8 @@ use libhac::{ReadAt, SubStorage, TitleId, npdm};
 use sha2::{Digest, Sha256};
 use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, ErrorKind, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const COMMON_CERT_SIZE: usize = 0x700;
@@ -37,6 +38,12 @@ pub const COMMON_CERT_SHA256: &str =
 pub fn is_common_cert(data: &[u8]) -> bool {
     hex::encode(Sha256::digest(data)) == COMMON_CERT_SHA256
 }
+
+/// The small files that are read into memory whole have their sizes in the
+/// NSP, and a sparse file can claim any size. A ticket is 0x2C0 bytes; the
+/// CNMT and the NPDM are a few KiB.
+const MAX_TICKET_SIZE: u64 = 0x10000;
+const MAX_META_FILE_SIZE: u64 = 0x100_0000;
 
 /// Size of the `XS00000020` ticket signer certificate, the first one in the
 /// common chain. Some update NSPs carry the chain with the two certificates
@@ -273,6 +280,7 @@ fn read_pfs_file(
     let matches: Vec<_> = pfs.entries().iter().filter(|e| pick(&e.name)).collect();
     match matches.as_slice() {
         [] => Ok(None),
+        [e] if e.size > MAX_META_FILE_SIZE => bail!("{} is too large ({})", e.name, e.size),
         [e] => Ok(Some(storage.read_vec(e.offset, e.size as usize)?)),
         _ => bail!("Sequence contains more than one element"),
     }
@@ -416,8 +424,9 @@ fn cache_common_cert(settings: &Settings, cert: Vec<u8>) {
 /// which may still be regenerated, are appended by `finish`. Dropping it
 /// before `finish` deletes the partial file.
 struct PartialNsp {
-    tmp: PathBuf,
     out: Option<BufWriter<File>>,
+    /// After `out`, so that the file is closed before it is deleted.
+    part: PartFile,
     /// Files before the tail, with their written sizes. For an NSZ the
     /// sizes are known only once the files are written, so `finish`
     /// writes the header again.
@@ -436,17 +445,28 @@ impl PartialNsp {
         tail: &[(String, Vec<u8>)],
         nsz: Option<&TitleKeys>,
     ) -> Result<Self> {
-        let mut tmp = target.as_os_str().to_owned();
-        tmp.push(".part");
+        let tmp = crate::with_suffix(target, ".part");
+        // Create first: an invalid target fails before any NCA is read.
+        // Never an existing file, also with `--overwrite`, and never
+        // through a link: it can be what another run for the same title is
+        // writing, and that run would give its name to this file.
+        let (part, file) =
+            PartFile::open(tmp.clone(), OpenOptions::new().write(true).create_new(true)).map_err(
+                |e| match e.kind() {
+                    ErrorKind::AlreadyExists => anyhow!(
+                        "{} exists: another run is writing it, or a run was killed. Delete it if no run is active.",
+                        tmp.display()
+                    ),
+                    _ => e.into(),
+                },
+            )?;
         let mut p = PartialNsp {
-            tmp: tmp.into(),
-            out: None,
+            out: Some(BufWriter::with_capacity(0x100000, file)),
+            part,
             files: Vec::new(),
             tail_sizes: tail.iter().map(|t| t.1.len() as u64).collect(),
             hashes: HashMap::new(),
         };
-        // Create first: an invalid target fails before any NCA is read.
-        let file = File::create(&p.tmp)?;
         // Each writer is planned once: planning reads the AesCtrEx tables,
         // which for a solid NCZ input means decoding up to them.
         let plain = order
@@ -470,7 +490,7 @@ impl PartialNsp {
         }
 
         let header = p.header(tail);
-        let out = p.out.insert(BufWriter::with_capacity(0x100000, file));
+        let out = p.out.as_mut().expect("started");
         out.write_all(&header)?;
         let label = if nsz.is_some() {
             "Compressing"
@@ -530,8 +550,12 @@ impl PartialNsp {
         }
         out.seek(SeekFrom::Start(0))?;
         out.write_all(&self.header(tail))?;
-        out.into_inner().map_err(|e| e.into_error())?;
-        std::fs::rename(&self.tmp, target)?;
+        // A write that the disk refuses later (full, quota, network) shows
+        // up here. Without it the file gets its name, and with `-Z` the
+        // source goes, while part of the data never arrives.
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        self.part.rename(target)?;
+        sync_parent(target);
         Ok(())
     }
 
@@ -558,12 +582,20 @@ fn ncz_writer<'a, S: ReadAt>(nca: &'a Nca<S>, tk: &TitleKeys) -> Result<Option<N
     Ok(NczWriter::new(nca, tk)?)
 }
 
-impl Drop for PartialNsp {
-    fn drop(&mut self) {
-        // After a successful rename the file is gone and this fails harmlessly.
-        let _ = std::fs::remove_file(&self.tmp);
+/// Make the new name of `path` last through a power cut. Best effort: not
+/// every filesystem can sync a directory.
+#[cfg(unix)]
+fn sync_parent(path: &Path) {
+    if let Some(dir) = path.parent()
+        && let Ok(dir) = File::open(dir)
+    {
+        let _ = dir.sync_all();
     }
 }
+
+/// Windows cannot open a directory as a file.
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) {}
 
 /// Refuses output paths over `limit` UTF-16 units on Windows, as the
 /// original tool does (254 for conversion, 258 for rename). std writes
@@ -761,7 +793,7 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             let range = SubStorage::new(&file, e.offset, e.size)?;
 
             if name.ends_with(".tik") {
-                let t = Ticket::parse(&range.read_vec(0, e.size as usize)?)?;
+                let t = Ticket::parse(&range.read_vec(0, e.size.min(MAX_TICKET_SIZE) as usize)?)?;
                 import_ticket(t, keys, &mut title_keys, &mut ticket)?;
                 vrb!("{phase} <- Ticket imported {}", paren(name));
             }
@@ -922,7 +954,9 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
                 let file = romfs
                     .find("/control.nacp")?
                     .ok_or_else(|| anyhow!("control.nacp not found in {}", n.file_name))?;
-                titles[pos].1 = Nacp::from_bytes(&romfs.read_file(&storage, &file)?);
+                // The rest of a larger file is not looked at.
+                let size = file.size.min(NACP_SIZE as u64) as usize;
+                titles[pos].1 = Nacp::from_bytes(&storage.read_vec(file.offset, size)?);
             }
         }
     }
@@ -969,32 +1003,36 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             ftl!("NSP Validation failed.");
             return Ok(1);
         }
-        let compressed = match raw_entries.iter().find(|r| r.name == file_name) {
-            None if ce.content_type == cnmt::ContentEntryType::DELTA_FRAGMENT => {
+        let ncz = ncas
+            .iter()
+            .filter(|n| n.nca_id.eq_ignore_ascii_case(&nca_id))
+            .find_map(|n| n.ncz.as_ref());
+        let mut compressed = false;
+        let size = match (raw_entries.iter().find(|r| r.name == file_name), ncz) {
+            (Some(r), _) => Some(r.size),
+            (None, _) if ce.content_type == cnmt::ContentEntryType::DELTA_FRAGMENT => {
                 delta_count += 1;
-                false
+                None
             }
-            None if ncas
-                .iter()
-                .any(|n| n.ncz.is_some() && n.nca_id.eq_ignore_ascii_case(&nca_id)) =>
-            {
-                true
+            (None, Some(z)) => {
+                compressed = true;
+                // The size it decodes to, which its own header states.
+                Some(z.size()?)
             }
-            None => {
+            (None, None) => {
                 errors.add(format!(
                     "{phase} - NSP file-system is missing content file : {file_name}"
                 ));
                 can_proceed = false;
-                false
-            }
-            Some(r) => {
-                if r.size != ce.size {
-                    errors.add(format!("{phase} - NSP file-system contains files with sizes that do not match the CNMT."));
-                    can_proceed = false;
-                }
-                false
+                None
             }
         };
+        if size.is_some_and(|s| s != ce.size) {
+            errors.add(format!(
+                "{phase} - NSP file-system contains files with sizes that do not match the CNMT."
+            ));
+            can_proceed = false;
+        }
         if content_files.iter().any(|c| c.file_name == file_name) {
             bail!("An item with the same key has already been added. Key: {file_name}");
         }
@@ -1391,7 +1429,10 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
             .iter()
             .any(|p| matches!(p, Planned::Missing(_) | Planned::MissingNcz(_)))
         && too_long.is_none()
-        && !(target_name == nsp_path || is_same_file(&target_name, nsp_path));
+        && !(target_name == nsp_path || is_same_file(&target_name, nsp_path))
+        // The sizes of what gets written were checked against the CNMT,
+        // which counts only when it comes from a signed meta NCA.
+        && ncas.iter().all(|n| n.nca.verify_header_signature());
     let mut pending = None;
     if would_convert {
         let order = output_order(&plan, meta_idx);
@@ -1692,11 +1733,11 @@ fn process_inner(settings: &Settings, keys: &Keys, nsp_path: &Path) -> Result<i3
         }
         rows.push(("Output Name", olive(&output_name)));
         let width = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
-        println!();
+        crate::log::line("");
         for (k, v) in rows {
-            println!("  {k:<width$} : {v}");
+            crate::log::line(&format!("  {k:<width$} : {v}"));
         }
-        println!();
+        crate::log::line("");
     }
 
     if !errors.is_empty() && settings.exit_on_error {

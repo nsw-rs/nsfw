@@ -18,8 +18,9 @@ verified and preserved.
 
 The port covers the `validate` command (including Standard NSP conversion
 and TitleDB lookups), `query` and `build-titledb`. Output file names, verdicts and the
-bytes of converted NSPs are identical to those of NSFW 0.1.184. It is a
-single self-contained binary: no .NET runtime is needed.
+bytes of converted NSPs are identical to those of NSFW 0.1.184, except
+where [Differences from NSFW](#differences-from-nsfw) says otherwise. It is
+a single self-contained binary: no .NET runtime is needed.
 
 The NSFW and LibHac repositories are no longer available on GitHub, so this
 port keeps the tool buildable and maintained.
@@ -54,8 +55,9 @@ This tool would not be possible without the work and knowledge of:
    [latest release](https://github.com/nsw-rs/nsfw/releases/latest) and
    extract `nsfw` (`nsfw.exe` on Windows) to a directory of your choice.
    Linux binaries are statically linked.
-1. Put your keys in `~/.switch/prod.keys` (or pass `-k`). On Windows `~` is
-   your user profile directory.
+1. Put your keys in `~/.switch/prod.keys` (or pass `-k`). `~` is `HOME`,
+   and on Windows your user profile directory when `HOME` is not set. Only
+   a path that is `~` or starts with `~/` is expanded.
 1. (*Optional*) The common certificate chain `~/.switch/common.cert` (or
    `-c`) is not shipped because it is Nintendo data. If it is missing, nsfw
    takes it from the first NSP it processes that has a ticket (BASE, UPD or
@@ -127,8 +129,27 @@ NSZ files (NSPs with compressed `.ncz` NCAs, block or solid) are accepted
 too, also in directory scans. They are reported with a "Compressed NCA"
 warning. See below for converting them to Standard NSP.
 
+> [!WARNING]
+> Like NSFW, a plain `validate` and `-r` do not decompress the `.ncz`
+> files, so damage inside one is not found and the exit code is 0. Only a
+> conversion (`-s`, `-S`) decompresses every NCA and checks its hash.
+
+`-H` checks the header and the string table padding of the NSP itself, not
+of the NCAs inside, and nothing else: with it `-s`, `-S` and `-r` do nothing.
+
+When `./titledb/titledb.db` (or the `--titledb` file) exists it is used for
+the output name (release region, and the title of a file that has none of
+its own) also without `-y`.
+
 Output is colored when it goes to a color terminal. Set `NO_COLOR` to turn
 colors off or `CLICOLOR_FORCE` to force them on. Piped output has no colors.
+Control characters in file names, titles and TitleDB text are printed in
+escaped form (`\u{1b}`).
+
+Exit codes: 0 when the file is valid (also when it is not a Standard NSP,
+and "Problems found" is printed) or was converted or renamed, 1 for a file
+that fails validation and for every other error, 2 when the output file
+exists and `--overwrite` is not given, and for a wrong command line.
 
 ### Validate - Example Usage
 
@@ -166,9 +187,16 @@ sorted as in a single directory scan, and the paths are processed in the
 order given. More than one path always runs in batch mode. A file reached
 through more than one argument is processed once. A missing path is reported
 and skipped (with `-e` it stops the run). In batch mode the exit code is the
-worst one over all files, not the one of the last file as in NSFW.
+worst one over all files (1 before 2), not the one of the last file as in
+NSFW.
 
 `./nsfw v <PATH_TO_NSP_FILE> <PATH_TO_NSP_DIRECTORY> ...`
+
+A directory scan takes every `*.ns?` file (in any case: `.nsp`, `.NSZ`),
+also in sub-directories. Links to directories are followed, so files
+outside the given directory can be reached, and each directory is scanned
+once. A directory that cannot be read is reported and skipped, and the run
+ends with exit code 1.
 
 ---
 
@@ -214,6 +242,14 @@ reported as Standard NSP and skipped, so `--force-convert` is needed to write
 the decompressed NSP.
 
 `./nsfw v -s --force-convert <PATH_TO_NSZ_FILE>`
+
+The output is written as `<name>.part` in the output directory, synced to
+disk and then renamed, so the final name only ever holds a complete file.
+The source is deleted (`-Z`) only after that. Ctrl-C and a closed output
+(`nsfw v -s dir | head`) stop the run and remove the partial file. A run
+that was killed leaves it behind, and a later run then refuses to convert
+that title until the `.part` file is deleted: it cannot know that no other
+run is writing it.
 
 ---
 
@@ -295,7 +331,9 @@ Options:
 Builds `titledb.db` from a checkout of
 [blawar/titledb](https://github.com/blawar/titledb), with the same schema and
 row order as NSFW. The database is written next to the JSON files, so the
-default layout matches the `--titledb` default of `validate`.
+default layout matches the `--titledb` default of `validate`. With `-c` the
+old database stays in place until the new one is complete. Without it the
+titles that are not in the database yet are added.
 
 ```
 Build titledb.db from the blawar/titledb JSON files
@@ -310,14 +348,49 @@ Options:
 
 ---
 
+## Differences from NSFW
+
+Names, verdicts and converted bytes are those of NSFW 0.1.184 for every
+file that NSFW handles, except where a point below says otherwise. What
+this port does differently:
+
+* Additions: several paths for `validate`, Standard NSZ output (`-S`), NSZ
+  input with solid NCZ, a common certificate taken from the NSP when the
+  file is missing, progress bars.
+* A compressed NCA whose size is not the one in the CNMT fails validation.
+  NSFW finds it only when it converts the file.
+* A conversion goes to a `.part` file that is renamed at the end. NSFW
+  writes the final name directly and deletes it when the conversion fails.
+* The output path length limit (254 characters) applies on Windows only.
+* `-r`: an NSZ keeps its `.nsz` extension, and `--overwrite` replaces an
+  existing file of the target name (NSFW fails there). `-r` with `-s` is
+  refused, and so is `--skip-hash` with `-s`.
+* Missing keys, a bad certificate or an empty directory end the run with a
+  message and exit code 1. In batch mode the exit code is the worst one.
+* A dry run (`-d`) and a run that finds no file do not create the output
+  directory.
+* The directory scan matches `*.ns?` in any case on every system (NSFW only
+  on Windows and macOS), lists each directory once and skips one that it
+  cannot read.
+* Only a leading `~` or `~/` is expanded, so `~name.nsp` is a file name.
+* TitleDB is opened without writing next to it, so it works from read-only
+  media. `build-titledb -c` keeps the old database until the new one is
+  complete, and a second run without `-c` no longer adds the update and
+  region rows again.
+* `query` prints plain rows instead of nested tables, and takes only a
+  hexadecimal title ID.
+* The properties table has no "Meta Validity" row.
+
 ## Not ported (yet)
 
 The following NSFW features are not available in this port:
 
-* `validate`: extract (`-x`, `-X`), `--full` output,
-  `--related-titles`, `--regional-titles`, `--updates`, `--show-keys`
+* `validate`: extract (`-x`, `-X`, `--force-extract`), `--full` output,
+  `--related-titles`, `--regional-titles`, `--updates`, `--show-keys`,
+  `--dump-headers`, `--cdndir`, `--wait`
 * the `ticket`, `cnmt`, `hash` and `cdn2nsp` commands, and the hidden
   `cmp`, `scan` and `ni` commands
+* the `btdb` alias of `build-titledb`
 
 ## License
 

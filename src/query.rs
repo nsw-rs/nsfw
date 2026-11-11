@@ -9,27 +9,33 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::log::olive;
+use crate::log::{line, olive};
 use crate::naming::remove_line_endings;
 use crate::titledb::{AMERICAS, ASIA, EUROPE, TitleDb};
 
 pub fn run(titledb: &Path, title_id: &str) -> Result<()> {
     let mut query = title_id.to_string();
     if let Some(base) = query.strip_suffix("800") {
-        println!("This is an update title ID. Searching parent title ID..");
+        line("This is an update title ID. Searching parent title ID..");
         query = format!("{base}000");
     }
 
     let db = TitleDb::open(titledb)?;
     let results = db.game_info(&query)?;
     let Some(first) = results.first() else {
-        println!("No results found.");
+        line("No results found.");
         return Ok(());
     };
 
-    println!();
+    line("");
     // Continuation lines of a multi-line value line up under its first line.
-    let top = |k: &str, v: &str| println!("  {k:<11} : {}", v.replace('\n', "\n                "));
+    let top = |k: &str, v: &str| {
+        let mut lines = v.split('\n').map(|l| l.trim_end_matches('\r'));
+        line(&format!("  {k:<11} : {}", lines.next().unwrap_or_default()));
+        for l in lines {
+            line(&format!("                {l}"));
+        }
+    };
     top("Name", &olive(first.name.as_deref().unwrap_or_default()));
     top("Publisher", first.publisher.as_deref().unwrap_or("Unknown"));
     top(
@@ -46,7 +52,7 @@ pub fn run(titledb: &Path, title_id: &str) -> Result<()> {
         &other
     };
     if !titles.is_empty() {
-        println!("  Regional Titles");
+        line("  Regional Titles");
         let mut seen = Vec::new();
         for t in titles {
             if seen.contains(&&t.region_language) {
@@ -55,11 +61,11 @@ pub fn run(titledb: &Path, title_id: &str) -> Result<()> {
             seen.push(&t.region_language);
             let lang = t.region_language.as_deref().unwrap_or_default();
             let name = remove_line_endings(t.name.as_deref().unwrap_or_default());
-            println!("    {:<5} : {name}", lang.to_uppercase());
+            line(&format!("    {:<5} : {name}", lang.to_uppercase()));
         }
     }
 
-    println!("  eShop Variations");
+    line("  eShop Variations");
     let mut seen = Vec::new();
     for r in &results {
         if seen.contains(&r.nsu_id) {
@@ -67,20 +73,20 @@ pub fn run(titledb: &Path, title_id: &str) -> Result<()> {
         }
         seen.push(r.nsu_id);
         let regions = db.nsu_regions(r.nsu_id)?.join(",");
-        println!("    NSU ID      : {}", r.nsu_id);
-        println!("    CDN Regions : {regions}");
-        println!(
+        line(&format!("    NSU ID      : {}", r.nsu_id));
+        line(&format!("    CDN Regions : {regions}"));
+        line(&format!(
             "    Region      : {}",
             eshop_region(&regions.to_uppercase())
-        );
+        ));
     }
 
     let updates = db.updates(&query)?;
     if !updates.is_empty() {
-        println!("  Updates");
+        line("  Updates");
         let width = updates.iter().map(|u| u.0.len() + 1).max().unwrap_or(0);
         for (version, date) in &updates {
-            println!("    {:<width$} : {date}", format!("v{version}"));
+            line(&format!("    {:<width$} : {date}", format!("v{version}")));
         }
     }
 
@@ -91,12 +97,12 @@ pub fn run(titledb: &Path, title_id: &str) -> Result<()> {
         }
     }
     if related.len() > 1 {
-        println!("  Related Titles");
+        line("  Related Titles");
         for r in &related {
-            println!("    {}", remove_line_endings(r));
+            line(&format!("    {}", remove_line_endings(r)));
         }
     }
-    println!();
+    line("");
     Ok(())
 }
 

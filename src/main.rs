@@ -8,11 +8,13 @@ mod diacritics;
 mod log;
 mod naming;
 mod query;
+mod stop;
 mod titledb;
 mod validate;
 
 use clap::{Parser, Subcommand};
 use naming::LanguageMode;
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
@@ -44,7 +46,7 @@ enum Command {
 struct QueryArgs {
     /// Path to titledb.db file.
     #[arg(long = "titledb", default_value = "./titledb/titledb.db")]
-    titledb: String,
+    titledb: PathBuf,
     /// Title ID to search for.
     #[arg(value_name = "TITLEID")]
     title_id: String,
@@ -54,7 +56,7 @@ struct QueryArgs {
 struct BuildTitleDbArgs {
     /// Path to TitleDB jsons directory.
     #[arg(long = "titledbdir", default_value = "./titledb")]
-    titledbdir: String,
+    titledbdir: PathBuf,
     /// Clean database before rebuilding.
     #[arg(short = 'c', long = "clean")]
     clean: bool,
@@ -64,10 +66,10 @@ struct BuildTitleDbArgs {
 struct ValidateArgs {
     /// Path to NSW keys file.
     #[arg(short = 'k', long = "keys", default_value = "~/.switch/prod.keys")]
-    keys: String,
+    keys: PathBuf,
     /// Path to 0x700-byte long common certificate chain file (created from the NSP if missing).
     #[arg(short = 'c', long = "cert", default_value = "~/.switch/common.cert")]
-    cert: String,
+    cert: PathBuf,
     /// Convert to Standardised NSP.
     #[arg(short = 's', long = "standard", conflicts_with = "rename")]
     standard: bool,
@@ -83,7 +85,7 @@ struct ValidateArgs {
     skip_hash: bool,
     /// Path to standardised NSP output directory.
     #[arg(short = 'o', long = "nspdir", default_value = "./nsp")]
-    nspdir: String,
+    nspdir: PathBuf,
     /// Prints actions to be performed but does not execute any of them.
     #[arg(short = 'd', long = "dryrun")]
     dryrun: bool,
@@ -125,7 +127,7 @@ struct ValidateArgs {
     skip: usize,
     /// Path to titledb.db file.
     #[arg(long = "titledb", default_value = "./titledb/titledb.db")]
-    titledb: String,
+    titledb: PathBuf,
     /// Verify title against TitleDB.
     #[arg(short = 'y', long = "verify")]
     verify: bool,
@@ -134,23 +136,42 @@ struct ValidateArgs {
     check_padding: bool,
     /// Paths to NSP files or directories.
     #[arg(required = true)]
-    nsp: Vec<String>,
+    nsp: Vec<PathBuf>,
 }
 
-/// Expand a leading `~` only; a `~` elsewhere in the path is a literal.
-/// Windows usually has no HOME, so fall back to USERPROFILE.
-fn expand_home(p: &str) -> String {
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
-    match (p.strip_prefix('~'), home) {
-        (Some(rest), Ok(home)) => format!("{home}{rest}"),
-        _ => p.to_string(),
+/// Expand a leading `~` component: `~user` and a file named `~x.nsp` are
+/// left alone. Windows usually has no HOME, so fall back to USERPROFILE.
+/// Without either the run ends: a directory named `~` is never meant.
+fn expand_home(p: &Path) -> PathBuf {
+    let Ok(rest) = p.strip_prefix("~") else {
+        return p.to_path_buf();
+    };
+    let home = ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .find(|h| !h.is_empty());
+    let Some(home) = home else {
+        eprintln!("Error: cannot expand '{}': HOME is not set.", p.display());
+        std::process::exit(1);
+    };
+    let mut home = PathBuf::from(home);
+    if !rest.as_os_str().is_empty() {
+        home.push(rest);
     }
+    home
+}
+
+/// `path` with `suffix` added to its file name.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(suffix);
+    p.into()
 }
 
 /// .NET `Path.GetFullPath`: make the path absolute and resolve `.` and `..`
 /// lexically, so the output path length matches the C# tool.
-fn full_path(p: &str) -> PathBuf {
-    let abs = std::path::absolute(p).unwrap_or_else(|_| PathBuf::from(p));
+fn full_path(p: &Path) -> PathBuf {
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
     let mut out = PathBuf::new();
     for c in abs.components() {
         match c {
@@ -165,31 +186,45 @@ fn full_path(p: &str) -> PathBuf {
 }
 
 /// Recursively collect files matching `*.ns?`, sorted case-insensitively.
+/// The extension matches in any case on every system (.NET does that on
+/// Windows and macOS only).
 ///
 /// Like .NET `Directory.EnumerateFiles`, symlinked directories are followed.
-/// A directory that resolves to one of its own ancestors is skipped, so a
-/// symlink loop ends instead of recursing until the stack overflows.
-fn collect_nsps(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+/// A directory is listed once, by the first path that reaches it, so a
+/// symlink loop ends and a link to a directory of the tree adds nothing.
+/// A directory that cannot be listed is reported and left out: the result
+/// is then `false`.
+fn collect_nsps(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
     let start = out.len();
-    collect_nsps_in(dir, &mut Vec::new(), out)?;
+    let complete = collect_nsps_in(dir, &mut HashSet::new(), out);
     out[start..].sort_by_cached_key(|p| ordinal_ignore_case_key(p));
-    Ok(())
+    complete
 }
 
-fn collect_nsps_in(
-    dir: &Path,
-    ancestors: &mut Vec<PathBuf>,
-    out: &mut Vec<PathBuf>,
-) -> std::io::Result<()> {
-    let real = std::fs::canonicalize(dir)?;
-    if ancestors.contains(&real) {
-        return Ok(());
-    }
-    ancestors.push(real);
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
+fn collect_nsps_in(dir: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) -> bool {
+    let entries = std::fs::canonicalize(dir).and_then(|real| {
+        if !seen.insert(real) {
+            return Ok(Vec::new());
+        }
+        std::fs::read_dir(dir)?
+            .map(|e| e.map(|e| e.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+    });
+    let mut entries = match entries {
+        Ok(e) => e,
+        Err(e) => {
+            let dir = dir.display().to_string();
+            eprintln!("Warning: skipping {}: {e}", log::plain(&dir));
+            return false;
+        }
+    };
+    // In name order, so that the path a directory is first reached by does
+    // not depend on the order the system lists them in.
+    entries.sort();
+    let mut complete = true;
+    for path in entries {
         if path.is_dir() {
-            collect_nsps_in(&path, ancestors, out)?;
+            complete &= collect_nsps_in(&path, seen, out);
             continue;
         }
         let name = path
@@ -197,14 +232,13 @@ fn collect_nsps_in(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         if let Some(pos) = name.rfind('.') {
-            let ext = &name[pos + 1..];
+            let ext = name[pos + 1..].to_lowercase();
             if ext.starts_with("ns") && ext.chars().count() <= 3 {
                 out.push(path);
             }
         }
     }
-    ancestors.pop();
-    Ok(())
+    complete
 }
 
 /// .NET `StringComparer.OrdinalIgnoreCase` sort key: simple (single char)
@@ -225,8 +259,8 @@ fn ordinal_ignore_case_key(p: &Path) -> Vec<u16> {
 }
 
 fn validate(args: ValidateArgs) -> u8 {
-    let keys_path = PathBuf::from(expand_home(&args.keys));
-    let cert_path = PathBuf::from(expand_home(&args.cert));
+    let keys_path = expand_home(&args.keys);
+    let cert_path = expand_home(&args.cert);
     let nsp_dir = full_path(&expand_home(&args.nspdir));
 
     // One file argument keeps the single file mode of the C# tool; anything
@@ -236,11 +270,15 @@ fn validate(args: ValidateArgs) -> u8 {
     let mut collection = Vec::new();
     let mut missing = false;
     for arg in &args.nsp {
-        let nsp = PathBuf::from(expand_home(arg));
+        let nsp = expand_home(arg);
         if nsp.is_dir() {
-            if let Err(e) = collect_nsps(&nsp, &mut collection) {
-                eprintln!("Error: failed to list {}: {e}", nsp.display());
-                return 1;
+            // The files of the directories that can be listed are still
+            // processed, and the run ends with an error code.
+            if !collect_nsps(&nsp, &mut collection) {
+                if args.exit_on_error {
+                    return 1;
+                }
+                missing = true;
             }
         } else if nsp.is_file() {
             if one_arg {
@@ -259,13 +297,11 @@ fn validate(args: ValidateArgs) -> u8 {
         }
     }
     // Overlapping arguments (a directory and a file inside it, or the same
-    // path twice) must not process a file twice: a second pass would fail on
-    // an output that exists, or on a source that `-Z` already deleted. One
-    // directory is left as scanned, like the C# tool.
-    if !one_arg {
-        let mut seen = std::collections::HashSet::new();
-        collection.retain(|p| seen.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())));
-    }
+    // path twice) and links to a file must not process a file twice: a
+    // second pass would fail on an output that exists, or on a source that
+    // `-Z` already deleted.
+    let mut seen = HashSet::new();
+    collection.retain(|p| seen.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())));
     if !keys_path.is_file() {
         eprintln!("Error: Keys file '{}' does not exist.", keys_path.display());
         return 1;
@@ -283,13 +319,6 @@ fn validate(args: ValidateArgs) -> u8 {
         }
     };
     let convert = args.standard || args.nsz;
-    if convert
-        && !nsp_dir.is_dir()
-        && let Err(e) = std::fs::create_dir_all(&nsp_dir)
-    {
-        eprintln!("Error: failed to create {}: {e}", nsp_dir.display());
-        return 1;
-    }
     if cert
         .as_deref()
         .is_some_and(|c| !validate::is_common_cert(c))
@@ -299,6 +328,15 @@ fn validate(args: ValidateArgs) -> u8 {
     }
     if single.is_none() && collection.is_empty() {
         eprintln!("Error: No NSP files found.");
+        return 1;
+    }
+    // Not before a run that writes nothing: a dry run, or one without files.
+    if convert
+        && !args.dryrun
+        && !nsp_dir.is_dir()
+        && let Err(e) = std::fs::create_dir_all(&nsp_dir)
+    {
+        eprintln!("Error: failed to create {}: {e}", nsp_dir.display());
         return 1;
     }
 
@@ -343,6 +381,7 @@ fn validate(args: ValidateArgs) -> u8 {
     };
 
     log::set_progress(!args.quiet);
+    stop::on_signal();
     if let Some(nsp) = single {
         log::set_quiet(args.quiet);
         let code = validate::process(&settings, &keys, &nsp);
@@ -356,9 +395,14 @@ fn validate(args: ValidateArgs) -> u8 {
         files.truncate(args.batch);
     }
     let total = files.len();
-    println!("Processing {total} NSPs ..");
+    log::line(&format!("Processing {total} NSPs .."));
     // The worst code over all files, so a failure is never hidden by a later
-    // success.
+    // success. A failure (1) is worse than an output that exists (2).
+    let rank = |code: i32| match code {
+        0 => 0,
+        2 => 1,
+        _ => 2,
+    };
     let mut worst = i32::from(missing);
     for (i, f) in files.iter().enumerate() {
         let code = validate::process(&settings, &keys, f);
@@ -366,8 +410,10 @@ fn validate(args: ValidateArgs) -> u8 {
             ftl!("Exiting on first error..");
             return code as u8;
         }
-        worst = worst.max(code);
-        println!("----- [{}/{total}] -----", i + 1);
+        if rank(code) > rank(worst) {
+            worst = code;
+        }
+        log::line(&format!("----- [{}/{total}] -----", i + 1));
     }
     worst as u8
 }
@@ -375,6 +421,11 @@ fn validate(args: ValidateArgs) -> u8 {
 fn query(args: QueryArgs) -> u8 {
     if args.title_id.chars().count() != 16 {
         eprintln!("Error: Title ID must be 16 characters long.");
+        return 1;
+    }
+    // The ID goes into a LIKE pattern, where `%` and `_` match anything.
+    if !args.title_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        eprintln!("Error: Title ID must be hexadecimal.");
         return 1;
     }
     let titledb = full_path(&expand_home(&args.titledb));
@@ -438,17 +489,29 @@ mod tests {
         symlink("..", root.join("a/loop")).unwrap();
         symlink("../other", root.join("a/linkdir")).unwrap();
 
+        std::fs::write(root.join("a/z.NSP"), b"z").unwrap();
+        std::fs::write(root.join("a/skip.nspx"), b"s").unwrap();
+
         let mut out = Vec::new();
-        collect_nsps(&root.join("a"), &mut out).unwrap();
+        assert!(collect_nsps(&root.join("a"), &mut out));
         out.sort();
         let a = root.join("a");
-        assert_eq!(
-            out,
-            [
-                a.join("linkdir/y.nsp"),
-                a.join("loop/other/y.nsp"),
-                a.join("x.nsp"),
-            ]
-        );
+        // `other` is listed through `linkdir`, and not again through `loop`.
+        let found = [a.join("linkdir/y.nsp"), a.join("x.nsp"), a.join("z.NSP")];
+        assert_eq!(out, found);
+
+        // A directory that cannot be listed is left out, the rest stays.
+        use std::os::unix::fs::PermissionsExt;
+        let locked = root.join("a/locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root lists it anyway.
+        let denied = std::fs::read_dir(&locked).is_err();
+        let mut out = Vec::new();
+        let complete = collect_nsps(&root.join("a"), &mut out);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        out.sort();
+        assert_eq!(complete, !denied);
+        assert_eq!(out, found);
     }
 }
